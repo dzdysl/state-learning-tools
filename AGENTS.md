@@ -17,3 +17,7 @@ This repository is the single versioned source for cross-platform state-learning
 - Do not use `git add .`; review the selected source files and generated artifacts first.
 - Do not commit, tag, or push unless the user explicitly requests it.
 - When the user explicitly requests a commit, immediately create an annotated, immutable tag after the commit succeeds. Use a purpose-and-date tag name. Never overwrite, delete, or move an existing tag—stop and report a name collision.
+- Before committing any platform source repository, run
+  `operations/workspace/New-StateLearningScriptArchives.ps1` for that repository and stage both
+  component-root `scripts.zip` deployment artifacts. After the commit, report whether `scripts/`
+  changed and whether Linux deployment requires `chmod +x scripts/*.sh`.
