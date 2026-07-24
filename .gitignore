@@ -1,0 +1,11 @@
+# Python interpreter by-products
+__pycache__/
+*.py[cod]
+
+# Temporary files and local render/build outputs
+*.tmp
+*.bak
+*.swp
+*.svg.tmp
+*.pdf.tmp
+*.png.tmp
