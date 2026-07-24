@@ -34,5 +34,7 @@ Mark a platform supported only when both halves and a smoke test exist. free5GC'
 
 - Source and configuration belong in Git.
 - `target`, duplicate JAR/ZIP files, logs, traces, databases, and generated diagrams are disposable or experiment artifacts.
-- Publish only the verified runnable fat JAR at the component root.
+- Publish the verified runnable fat JAR and deterministic `scripts.zip` at each component root.
+- When repository-root UERANSIM `src/` changes, refresh the repository-root Git-LFS `src.zip` in
+  the same commit.
 - Default build runtime: JDK 17. Maven source/target compatibility: Java 11.

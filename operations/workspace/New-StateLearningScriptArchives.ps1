@@ -20,13 +20,18 @@ Add-Type -AssemblyName System.IO.Compression
 function Get-TreeHash {
     param(
         [System.IO.FileInfo[]]$Files,
-        [string]$ComponentRoot
+        [string]$SourceRoot,
+        [string]$EntryRoot
     )
 
     $records = foreach ($file in $Files) {
-        $relativePath = [System.IO.Path]::GetRelativePath($ComponentRoot, $file.FullName).Replace('\', '/')
+        $relativePath = [System.IO.Path]::GetRelativePath(
+            $SourceRoot,
+            $file.FullName
+        ).Replace('\', '/')
+        $entryPath = "$EntryRoot/$relativePath"
         $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-        "$relativePath`0$hash"
+        "$entryPath`0$hash"
     }
     $bytes = [System.Text.Encoding]::UTF8.GetBytes(($records -join "`n"))
     return [System.Convert]::ToHexString(
@@ -34,23 +39,23 @@ function Get-TreeHash {
     ).ToLowerInvariant()
 }
 
-function Write-DeterministicScriptArchive {
+function Write-DeterministicArchive {
     param(
-        [string]$ComponentRoot,
+        [string]$SourceRoot,
+        [string]$EntryRoot,
         [string]$ArchivePath
     )
 
-    $scriptsRoot = Join-Path $ComponentRoot 'scripts'
-    if (-not (Test-Path -LiteralPath $scriptsRoot -PathType Container)) {
-        throw "Scripts directory is missing: $scriptsRoot"
+    if (-not (Test-Path -LiteralPath $SourceRoot -PathType Container)) {
+        throw "Archive source directory is missing: $SourceRoot"
     }
 
     $files = @(
-        Get-ChildItem -LiteralPath $scriptsRoot -File -Recurse -Force |
+        Get-ChildItem -LiteralPath $SourceRoot -File -Recurse -Force |
             Sort-Object FullName
     )
     if ($files.Count -eq 0) {
-        throw "Scripts directory is empty: $scriptsRoot"
+        throw "Archive source directory is empty: $SourceRoot"
     }
 
     $temporaryArchive = $ArchivePath + '.publishing'
@@ -72,16 +77,17 @@ function Write-DeterministicScriptArchive {
             [System.Text.Encoding]::UTF8
         )
         try {
-            $directoryEntry = $archive.CreateEntry('scripts/')
+            $directoryEntry = $archive.CreateEntry("$EntryRoot/")
             $directoryEntry.LastWriteTime = [DateTimeOffset]::new(1980, 1, 1, 0, 0, 0, [TimeSpan]::Zero)
 
             foreach ($file in $files) {
                 $relativePath = [System.IO.Path]::GetRelativePath(
-                    $ComponentRoot,
+                    $SourceRoot,
                     $file.FullName
                 ).Replace('\', '/')
+                $entryPath = "$EntryRoot/$relativePath"
                 $entry = $archive.CreateEntry(
-                    $relativePath,
+                    $entryPath,
                     [System.IO.Compression.CompressionLevel]::Optimal
                 )
                 $entry.LastWriteTime = [DateTimeOffset]::new(
@@ -104,9 +110,13 @@ function Write-DeterministicScriptArchive {
         $fileStream.Dispose()
     }
 
-    $expectedEntries = @('scripts/') + @(
+    $expectedEntries = @("$EntryRoot/") + @(
         $files | ForEach-Object {
-            [System.IO.Path]::GetRelativePath($ComponentRoot, $_.FullName).Replace('\', '/')
+            $relativePath = [System.IO.Path]::GetRelativePath(
+                $SourceRoot,
+                $_.FullName
+            ).Replace('\', '/')
+            "$EntryRoot/$relativePath"
         }
     )
     $validationStream = [System.IO.File]::OpenRead($temporaryArchive)
@@ -132,7 +142,7 @@ function Write-DeterministicScriptArchive {
     Move-Item -LiteralPath $temporaryArchive -Destination $ArchivePath -Force
     return [pscustomobject]@{
         FileCount = $files.Count
-        TreeHash = Get-TreeHash -Files $files -ComponentRoot $ComponentRoot
+        TreeHash = Get-TreeHash -Files $files -SourceRoot $SourceRoot -EntryRoot $EntryRoot
     }
 }
 
@@ -168,8 +178,9 @@ foreach ($projectId in $selectedProjects) {
                 throw "Could not inspect scripts status for $componentRoot"
             }
 
-            $result = Write-DeterministicScriptArchive `
-                -ComponentRoot $componentRoot `
+            $result = Write-DeterministicArchive `
+                -SourceRoot (Join-Path $componentRoot 'scripts') `
+                -EntryRoot 'scripts' `
                 -ArchivePath $archivePath
             $archiveHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
 
@@ -185,5 +196,44 @@ foreach ($projectId in $selectedProjects) {
                 chmod_command = 'chmod +x scripts/*.sh'
             } | ConvertTo-Json -Compress
         }
+    }
+
+    $sourceStatus = @(& git -C $repoRoot status --porcelain=v1 -- 'src')
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not inspect UERANSIM source status for $repoRoot"
+    }
+    $sourceArchivePath = Join-Path $repoRoot 'src.zip'
+    $sourceChanged = $sourceStatus.Count -gt 0
+    if ($sourceChanged -and
+        $PSCmdlet.ShouldProcess($sourceArchivePath, 'Package changed UERANSIM source directory')) {
+        $sourceResult = Write-DeterministicArchive `
+            -SourceRoot (Join-Path $repoRoot 'src') `
+            -EntryRoot 'src' `
+            -ArchivePath $sourceArchivePath
+        $sourceArchiveHash = (Get-FileHash -LiteralPath $sourceArchivePath -Algorithm SHA256).Hash
+        [pscustomobject]@{
+            project = $projectId
+            component = 'ueransim-src'
+            source_changed = $true
+            archive_updated = $true
+            archive = $sourceArchivePath
+            archive_sha256 = $sourceArchiveHash
+            source_tree_sha256 = $sourceResult.TreeHash
+            file_count = $sourceResult.FileCount
+        } | ConvertTo-Json -Compress
+    } elseif (-not $sourceChanged) {
+        $existingHash = if (Test-Path -LiteralPath $sourceArchivePath -PathType Leaf) {
+            (Get-FileHash -LiteralPath $sourceArchivePath -Algorithm SHA256).Hash
+        } else {
+            $null
+        }
+        [pscustomobject]@{
+            project = $projectId
+            component = 'ueransim-src'
+            source_changed = $false
+            archive_updated = $false
+            archive = if ($existingHash) { $sourceArchivePath } else { $null }
+            archive_sha256 = $existingHash
+        } | ConvertTo-Json -Compress
     }
 }

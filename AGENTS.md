@@ -19,5 +19,7 @@ This repository is the single versioned source for cross-platform state-learning
 - When the user explicitly requests a commit, immediately create an annotated, immutable tag after the commit succeeds. Use a purpose-and-date tag name. Never overwrite, delete, or move an existing tag—stop and report a name collision.
 - Before committing any platform source repository, run
   `operations/workspace/New-StateLearningScriptArchives.ps1` for that repository and stage both
-  component-root `scripts.zip` deployment artifacts. After the commit, report whether `scripts/`
-  changed and whether Linux deployment requires `chmod +x scripts/*.sh`.
+  component-root `scripts.zip` deployment artifacts. If repository-root UERANSIM `src/` changed,
+  the same tool must refresh and stage repository-root `src.zip`. After the commit, report whether
+  `scripts/` and `src/` changed, both archive outcomes, and whether Linux deployment requires
+  `chmod +x scripts/*.sh`.

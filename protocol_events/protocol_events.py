@@ -9,7 +9,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA = "protocol-events/v1"
+SCHEMA = "protocol-events/v2"
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 OPEN_TS = re.compile(r"(?P<date>\d{2}/\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2}\.\d{3})")
 ISO_TS = re.compile(r"(?P<time>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)")
@@ -28,6 +28,31 @@ def timestamp(line: str):
     # Open5GS omits year/zone. Keep source clock unambiguous rather than inventing one.
     m = OPEN_TS.search(line)
     return f"source-clock:{m.group('date')}T{m.group('time')}" if m else None
+
+def log_level(line: str, semantic_kind: str | None = None) -> str:
+    structured = re.search(
+        r'\blevel\s*=\s*["\']?(trace|debug|info|notice|warn|warning|error|critical|fatal|panic)\b',
+        line,
+        re.I,
+    )
+    if structured:
+        value = structured.group(1).lower()
+    else:
+        prefixed = re.search(
+            r'(?:^|[\s\[])'
+            r'(trace|debug|info|notice|warn|warning|error|critical|fatal|panic)'
+            r'(?=[:\]"\s])',
+            line,
+            re.I,
+        )
+        value = prefixed.group(1).lower() if prefixed else ""
+    if value in {"warn", "warning"}:
+        return "warning"
+    if value in {"critical", "fatal", "panic"}:
+        return "error"
+    if value:
+        return value
+    return "error" if semantic_kind == "error" else "info"
 
 def identifiers(line: str):
     values = {}
@@ -79,14 +104,19 @@ def classify(platform: str, line: str):
         elif "nas mac verification failed" in lower: set_("error", "nas", None, "NasMacVerificationFailed")
         elif "ue context release" in lower: set_("context", "ngap", "downlink", action="ue_context_release")
         elif "number of amf-ues" in lower or "number of gnb-ues" in lower: set_("context", "ngap", action="ue_context_count")
-    if result["kind"] is None and ("error" in lower or "warning" in lower or "failed" in lower):
-        set_("error", "core", action=line)
+    if result["kind"] is None:
+        severity = log_level(line)
+        if severity == "warning":
+            set_("warning", "core", action=line)
+        elif severity == "error" or "error" in lower or "failed" in lower:
+            set_("error", "core", action=line)
     return result if result["kind"] else None
 
 def event(platform, run_id, session, source, line_no, raw, kind):
     return {"schema_version": SCHEMA, "event_id": f"{source}:{line_no}", "platform": platform,
             "run_id": run_id, "session_id": session, "source": source, "timestamp": timestamp(raw),
-            **kind, "identifiers": identifiers(raw), "raw_ref": {"source": source, "line": line_no}, "raw": raw}
+            "level": log_level(raw, kind.get("kind")), **kind, "identifiers": identifiers(raw),
+            "raw_ref": {"source": source, "line": line_no}, "raw": raw}
 
 def parse_core(args):
     output = Path(args.output); output.parent.mkdir(parents=True, exist_ok=True)
@@ -105,7 +135,8 @@ def normalize_ue(args):
             observed = record.get("observed_at_utc")
             item = {"schema_version": SCHEMA, "event_id": f"ue:{number}", "platform": args.platform,
                     "run_id": args.run_id, "session_id": str(record.get("socket_session_id", "unknown")),
-                    "source": Path(args.input).name, "timestamp": observed, "kind": "ue_observation", "layer": "nas",
+                    "source": Path(args.input).name, "timestamp": observed, "level": "info",
+                    "kind": "ue_observation", "layer": "nas",
                     "direction": "bidirectional", "message": record.get("abstract_io", {}).get("input"),
                     "action": record.get("abstract_io", {}).get("output"), "state_before": None, "state_after": None,
                     "identifiers": {}, "raw_ref": {"source": Path(args.input).name, "line": number}, "raw": record}
