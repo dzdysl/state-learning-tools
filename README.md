@@ -18,7 +18,7 @@ command also refreshes the versioned repository-root `src.zip`.
 - `refinement/counterexample_ttt`：基于反例快速细化 TTT 模型。
 - `protocol_events`：将三套核心网与 UERANSIM 日志冻结为可追溯的协议事件流。
 - `analysis/state_distinction`：模拟输入并证明两个 Mealy 状态/类别的行为区分（`explain_distinction.py`）。
-- `analysis/reachability`：查找最短访问序列与可达性（`find_shortest_paths.py`）。
+- `analysis/reachability`：查找最短访问序列与可达性（`find_shortest_paths.py`）；结果在保留输入数组与逐跳轨迹的同时，另提供可直接执行的空格分隔 `input_sequence_text`。
 - `operations/workspace`：六个学习器 JAR 的构建发布与整个工作区状态检查。
 - `operations/experiment_archive`：失败实验的日志清单、哈希和大小分级归档。
 

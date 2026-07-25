@@ -79,6 +79,11 @@ def reconstruct(predecessor: dict[str, tuple[str, dict[str, str]]], start: str, 
     return trace
 
 
+def format_input_sequence(input_sequence: list[str]) -> str:
+    """Return the directly usable, space-delimited input sequence."""
+    return " ".join(input_sequence) if input_sequence else "(空序列)"
+
+
 def build_results(model: dict[str, Any], start: str, targets: list[str]) -> list[dict[str, Any]]:
     predecessor, visited = bfs(model, start)
     results = []
@@ -89,11 +94,13 @@ def build_results(model: dict[str, Any], start: str, targets: list[str]) -> list
             results.append({"target": target, "reachable": False, "reason": "unreachable"})
         else:
             trace = reconstruct(predecessor, start, target)
+            input_sequence = [edge["input"] for edge in trace]
             results.append({
                 "target": target,
                 "reachable": True,
                 "length": len(trace),
-                "input_sequence": [edge["input"] for edge in trace],
+                "input_sequence": input_sequence,
+                "input_sequence_text": format_input_sequence(input_sequence),
                 "output_sequence": [edge["output"] for edge in trace],
                 "state_sequence": [start, *[edge["dst"] for edge in trace]],
                 "trace": trace,
@@ -111,8 +118,7 @@ def write_report(payload: dict[str, Any], path: Path) -> None:
         if not item["reachable"]:
             lines.extend([f"不可达：`{item['reason']}`。", ""])
             continue
-        sequence = " ".join(item["input_sequence"]) or "(空序列)"
-        lines.extend([f"- 长度：{item['length']}", f"- 输入序列：`{sequence}`", "", "| 步骤 | 源状态 | 输入 | 输出 | 目标状态 |", "|---:|---|---|---|---|"])
+        lines.extend([f"- 长度：{item['length']}", f"- 输入序列：`{item['input_sequence_text']}`", "", "| 步骤 | 源状态 | 输入 | 输出 | 目标状态 |", "|---:|---|---|---|---|"])
         for index, edge in enumerate(item["trace"], 1):
             lines.append(f"| {index} | `{edge['src']}` | `{edge['input']}` | `{edge['output']}` | `{edge['dst']}` |")
         lines.append("")
