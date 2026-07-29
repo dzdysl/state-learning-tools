@@ -4,7 +4,8 @@
 component `scripts/` directory as the versioned component-root `scripts.zip` before a platform
 repository commit. It also reports whether scripts changed and whether Linux extraction requires
 `chmod +x scripts/*.sh`. When Git reports a change under repository-root UERANSIM `src/`, the same
-command also refreshes the versioned repository-root `src.zip`.
+command refreshes the versioned repository-root `src.zip`; when that archive is missing, it creates
+the initial deterministic `src.zip` even if the source tree itself is clean.
 
 该仓库用于保存跨 Open5GS、free5GC 和 OAI 的状态机分析、渲染、实验归档和工作区操作工具。它是这些脚本和语义文档的唯一源码；个人 Codex skill 仅负责识别任务、给出行为约束并调用此处的版本。
 

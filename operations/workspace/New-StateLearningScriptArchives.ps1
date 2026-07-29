@@ -204,8 +204,15 @@ foreach ($projectId in $selectedProjects) {
     }
     $sourceArchivePath = Join-Path $repoRoot 'src.zip'
     $sourceChanged = $sourceStatus.Count -gt 0
-    if ($sourceChanged -and
-        $PSCmdlet.ShouldProcess($sourceArchivePath, 'Package changed UERANSIM source directory')) {
+    $sourceArchiveMissing = -not (Test-Path -LiteralPath $sourceArchivePath -PathType Leaf)
+    $sourceArchiveRequired = $sourceChanged -or $sourceArchiveMissing
+    $sourceArchiveAction = if ($sourceChanged) {
+        'Package changed UERANSIM source directory'
+    } else {
+        'Create missing UERANSIM source archive'
+    }
+    if ($sourceArchiveRequired -and
+        $PSCmdlet.ShouldProcess($sourceArchivePath, $sourceArchiveAction)) {
         $sourceResult = Write-DeterministicArchive `
             -SourceRoot (Join-Path $repoRoot 'src') `
             -EntryRoot 'src' `
@@ -214,14 +221,15 @@ foreach ($projectId in $selectedProjects) {
         [pscustomobject]@{
             project = $projectId
             component = 'ueransim-src'
-            source_changed = $true
+            source_changed = $sourceChanged
             archive_updated = $true
+            archive_created = $sourceArchiveMissing
             archive = $sourceArchivePath
             archive_sha256 = $sourceArchiveHash
             source_tree_sha256 = $sourceResult.TreeHash
             file_count = $sourceResult.FileCount
         } | ConvertTo-Json -Compress
-    } elseif (-not $sourceChanged) {
+    } elseif (-not $sourceArchiveRequired) {
         $existingHash = if (Test-Path -LiteralPath $sourceArchivePath -PathType Leaf) {
             (Get-FileHash -LiteralPath $sourceArchivePath -Algorithm SHA256).Hash
         } else {
