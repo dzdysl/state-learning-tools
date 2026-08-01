@@ -1,0 +1,4 @@
+{"transition":{"source":"s0","target":"s1","input":"increment"},"register":{"before":0,"after":1},"inputs":{"i0":9},"sequence":"sample","cycle":"c1","iteration":2}
+{"transition":{"source":"s0","target":"s1","input":"increment"},"register":{"before":3,"after":4},"inputs":{"i0":8},"sequence":"sample","cycle":"c1","iteration":3}
+{"transition":{"source":"s1","target":"s0","input":"echo"},"register":{"before":4,"after":9},"inputs":{"i0":9},"sequence":"sample","cycle":"c1","iteration":2}
+{"transition":{"source":"s1","target":"s0","input":"echo"},"register":{"before":8,"after":7},"inputs":{"i0":7},"sequence":"sample","cycle":"c1","iteration":3}

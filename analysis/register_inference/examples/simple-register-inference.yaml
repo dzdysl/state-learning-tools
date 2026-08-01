@@ -1,0 +1,37 @@
+schema_version: 1
+
+inputs:
+  dot: simple.dot
+  trace: simple-trace.jsonl
+
+# Every field mapping is explicit.  The v1 adapter accepts dotted object paths;
+# it does not assume KSI, a fixed initial value, a root state, or a trace layout.
+mapping:
+  source_state: transition.source
+  target_state: transition.target
+  input_symbol: transition.input
+  sequence_id: sequence
+  cycle_id: cycle
+  iteration: iteration
+  registers:
+    - id: r0
+      before: register.before
+      after: register.after
+  input_variables:
+    - id: i0
+      path: inputs.i0
+
+candidate_generator:
+  implementation: simple_scalar_v1
+  priority: [identity, constant, add_constant, copy_input]
+
+fitter:
+  implementation: z3_scalar_edge_v1
+
+# Reserved extension points; neither is executed by v1.
+guard_generator:
+  implementation: disabled
+cegis:
+  implementation: unsupported_v1
+output:
+  implementation: unsupported_v1
