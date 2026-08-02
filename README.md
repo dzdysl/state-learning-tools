@@ -20,6 +20,7 @@ the initial deterministic `src.zip` even if the source tree itself is clean.
 - `protocol_events`：将三套核心网与 UERANSIM 日志冻结为可追溯的协议事件流。
 - `analysis/state_distinction`：模拟输入并证明两个 Mealy 状态/类别的行为区分（`explain_distinction.py`）。
 - `analysis/reachability`：查找最短访问序列与可达性（`find_shortest_paths.py`）；结果在保留输入数组与逐跳轨迹的同时，另提供可直接执行的空格分隔 `input_sequence_text`。
+- `analysis/cycle_cover`：对 SMP 目标边求精确的信令约束环/闭合游走覆盖，并可将选中路径转换为“最短访问前缀 + 固定环重复”的 `.seq` 输入（`analyze_cycle_cover.py`）；同一工作流还规定从第 2–10 轮启发式尝试 `r'=r`、`r'=0`、`r'=r+1` 等 AMF 逻辑寄存器候选，见 [`docs/mealy/cycle-cover-sequence-workflow.md`](docs/mealy/cycle-cover-sequence-workflow.md)。
 - `operations/workspace`：六个学习器 JAR 的构建发布与整个工作区状态检查。
 - `operations/experiment_archive`：失败实验的日志清单、哈希和大小分级归档。
 
