@@ -1,5 +1,8 @@
 # Register-state-machine inference workflow
 
+类型化时序候选树的完整设计说明见
+[typed-temporal-register-inference-design.md](typed-temporal-register-inference-design.md)。
+
 `analysis/register_inference/analyze_register_machine.py` turns explicitly
 mapped integer observations into a reviewable, edge-local register-update
 candidate fit.  It is a first-stage inference aid, not proof of an AMF's
