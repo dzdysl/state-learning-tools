@@ -23,14 +23,21 @@ from infer_cycle_ngksi_regions import (
     RegionInferenceError,
     build_regions,
     candidate_status,
+    default_signal_tree,
+    effective_snapshot,
     guarded_candidates,
     infer,
     load_config,
+    numeric_input_observations,
     signal_gated_candidates,
     signal_observations,
+    standalone_event_sample,
     stable_slots,
+    tree_text,
     validate_signal_definitions,
+    validate_numeric_input_definitions,
     validate_observation_alignment,
+    v3_input_register_updates,
 )
 
 
@@ -105,47 +112,156 @@ def _region(repetition: int, before: int, after: int, *, signals: list[dict] | N
 
 class CycleNgksiRegionTests(unittest.TestCase):
     @unittest.skipUnless(REAL_CONFIG.exists(), "C01/C02 frozen integration fixture is not available")
-    def test_real_c01_c05_trace_end_to_end(self) -> None:
+    def test_real_c01_c14_trace_end_to_end(self) -> None:
         result = infer(load_config(REAL_CONFIG), REAL_CONFIG)
         by_edge = {item["edge"]["edge_id"]: item for item in result["results"]}
-        self.assertEqual(15, len(by_edge))
+        self.assertEqual(3, result["schema_version"])
+        self.assertEqual(42, len(by_edge))
         self.assertEqual("r' = r", by_edge["E0019"]["candidates"][0]["update_tree_text"])
+        self.assertEqual("relatively_stable_candidate", by_edge["E0019"]["candidates"][0]["candidate_grade"])
+        self.assertEqual("r_i[ngksi_uplink]' = r_i[ngksi_uplink]", by_edge["E0019"]["candidates"][0]["input_register_updates"][0]["update"]["text"])
         self.assertIn("if s0 == 1:\n  unknown/unobserved_signal_branch", by_edge["E0037"]["candidates"][0]["update_tree_text"])
         self.assertIn("if r < 6:\n    r' = r + 1", by_edge["E0037"]["candidates"][0]["update_tree_text"])
+        self.assertEqual(3, by_edge["E0037"]["direct_regions"][0]["repetition"])
         c02_normal = by_edge["E0145"]
-        self.assertEqual(
-            (1, [1, 7], 2),
-            (
-                c02_normal["regions"][0]["previous_output"]["value"],
-                [item["value"] for item in c02_normal["regions"][0]["observation_items"]],
-                c02_normal["regions"][0]["terminal_output"]["value"],
-            ),
-        )
+        self.assertEqual("hypothetical_candidate", c02_normal["candidates"][0]["candidate_grade"])
+        self.assertEqual((2, [1, 7], 3), (c02_normal["direct_regions"][0]["previous_output"]["value"], [item["value"] for item in c02_normal["direct_regions"][0]["signals"] + c02_normal["direct_regions"][0]["inputs"]], c02_normal["direct_regions"][0]["terminal_output"]["value"]))
         self.assertIn("if r < 6:\n    r' = r + 1", c02_normal["candidates"][0]["update_tree_text"])
         c02_guti_text = {candidate["update_tree_text"] for candidate in by_edge["E0146"]["candidates"]}
-        self.assertEqual(3, len(c02_guti_text))
-        self.assertTrue(any("r' = r" in text for text in c02_guti_text))
-        self.assertTrue(any("r' = 1" in text for text in c02_guti_text))
-        self.assertTrue(any("r' = i0 + 1" in text for text in c02_guti_text))
+        self.assertEqual(2, len(c02_guti_text))
+        self.assertTrue(all("r_i[ngksi_uplink] + 1" in text for text in c02_guti_text))
+        self.assertEqual("r' = r", by_edge["E0160"]["candidates"][0]["update_tree_text"])
+        self.assertEqual("r_i[ngksi_uplink]' = r_i[ngksi_uplink]", by_edge["E0160"]["candidates"][0]["input_register_updates"][0]["update"]["text"])
         self.assertEqual("r' = r", by_edge["E0163"]["candidates"][0]["update_tree_text"])
         self.assertIn("if r < 6:\n    r' = r + 1", by_edge["E0169"]["candidates"][0]["update_tree_text"])
-        self.assertEqual(
-            (2, [0, 7], 3),
-            (
-                by_edge["E0169"]["regions"][0]["previous_output"]["value"],
-                [item["value"] for item in by_edge["E0169"]["regions"][0]["observation_items"]],
-                by_edge["E0169"]["regions"][0]["terminal_output"]["value"],
-            ),
-        )
+        self.assertEqual((3, [0, 7], 4), (by_edge["E0169"]["direct_regions"][0]["previous_output"]["value"], [item["value"] for item in by_edge["E0169"]["direct_regions"][0]["signals"] + by_edge["E0169"]["direct_regions"][0]["inputs"]], by_edge["E0169"]["direct_regions"][0]["terminal_output"]["value"]))
         self.assertEqual(4, len(by_edge["E0170"]["candidates"]))
         self.assertEqual(4, len(by_edge["E0050"]["candidates"]))
         c04_registration = by_edge["E0073"]
-        self.assertEqual(2, len(c04_registration["signal_slots"]))
-        self.assertEqual(2, len(c04_registration["input_slots"]))
-        self.assertEqual([1, 7, 0, 7], [item["value"] for item in c04_registration["regions"][0]["observation_items"]])
-        self.assertEqual(4, len(c04_registration["candidates"]))
-        self.assertEqual(3, len(by_edge["E0083"]["candidates"]))
+        self.assertEqual(1, len(c04_registration["signal_slots"]))
+        self.assertEqual([1, 7, 0, 7], [item["value"] for item in c04_registration["direct_regions"][0]["raw_region"]])
+        self.assertEqual([0, 7], [item["value"] for item in c04_registration["direct_regions"][0]["effective_region_snapshot"]["observation_items"]])
+        self.assertEqual([], c04_registration["candidates"])
+        self.assertEqual((0, 0), (c04_registration["direct_regions"][0]["previous_output"]["value"], c04_registration["direct_regions"][0]["terminal_output"]["value"]))
+        self.assertIn((0, 1), {(sample["previous_output"]["value"], sample["terminal_output"]["value"]) for sample in c04_registration["direct_regions"]})
+        reconciliation = c04_registration["hypothetical_reconciliation"]
+        self.assertEqual("confirmed_observational_conflict", reconciliation["reconciliation_status"])
+        self.assertEqual([], reconciliation["intersection_candidates"])
+        partitions = {partition["cycle_id"]: partition for partition in reconciliation["partitions"]}
+        self.assertEqual({"C04", "C14"}, set(partitions))
+        self.assertTrue(any("r' = r" in candidate["update_tree_text"] for candidate in partitions["C04"]["candidates"]))
+        self.assertTrue(any("if r < 6:" in candidate["update_tree_text"] for candidate in partitions["C14"]["candidates"]))
+        conflict = reconciliation["observational_conflicts"][0]
+        self.assertEqual([0, 1], conflict["r_after_values"])
+        self.assertEqual(0, conflict["observation"]["r_before"])
+        self.assertEqual(7, conflict["observation"]["numeric_inputs"][0]["value"])
+        self.assertEqual({"C04", "C14"}, {item["cycle_id"] for item in conflict["evidence"]})
+        self.assertIn("unknown/unanchored_signal_context", by_edge["E0002"]["candidates"][0]["update_tree_text"])
+        self.assertEqual("r_i[ngksi_uplink]' = i", by_edge["E0002"]["candidates"][0]["input_register_updates"][0]["update"]["text"])
+        self.assertEqual("r' = r", by_edge["E0016"]["candidates"][0]["update_tree_text"])
+        self.assertEqual("r_i[ngksi_uplink]' = r_i[ngksi_uplink]", by_edge["E0016"]["candidates"][0]["input_register_updates"][0]["update"]["text"])
+        self.assertEqual(2, len(by_edge["E0083"]["candidates"]))
+        self.assertTrue(all("r_i[ngksi_uplink] < 6" in candidate["update_tree_text"] for candidate in by_edge["E0083"]["candidates"]))
+        c06_registration = by_edge["E0085"]
+        self.assertEqual("hypothetical_candidate", c06_registration["candidates"][0]["candidate_grade"])
+        self.assertEqual(2, len(c06_registration["candidates"]))
+        self.assertTrue(all("if s0 == 1:" in candidate["update_tree_text"] for candidate in c06_registration["candidates"]))
+        self.assertTrue(all("r' = r\n" not in candidate["update_tree_text"] for candidate in c06_registration["candidates"]))
+        c06_smc_text = {candidate["update_tree_text"] for candidate in by_edge["E0103"]["candidates"]}
+        self.assertEqual({"r' = r", "r' = 0", "r' = r_i[ngksi_uplink] - 7"}, c06_smc_text)
+        self.assertEqual("relatively_stable_candidate", by_edge["E0103"]["candidates"][0]["candidate_grade"])
+        self.assertEqual("r' = r", by_edge["E0114"]["candidates"][0]["update_tree_text"])
+        self.assertEqual("r_i[ngksi_uplink]' = r_i[ngksi_uplink]", by_edge["E0114"]["candidates"][0]["input_register_updates"][0]["update"]["text"])
+        self.assertEqual("r' = r", by_edge["E0172"]["candidates"][0]["update_tree_text"])
+        self.assertEqual("hypothetical_candidate", by_edge["E0172"]["candidates"][0]["candidate_grade"])
+        self.assertEqual("r' = r", by_edge["E0042"]["candidates"][0]["update_tree_text"])
+        self.assertEqual(3, len(by_edge["E0097"]["candidates"]))
+        self.assertIn("r' = r + 1", by_edge["E0097"]["candidates"][1]["update_tree_text"])
+        self.assertIn("r_i[ngksi_uplink] < 6", by_edge["E0098"]["candidates"][0]["update_tree_text"])
         self.assertEqual("r' = r", by_edge["E0019"]["candidates"][0]["update_tree_text"])
+        c09_registration = by_edge["E0001"]
+        self.assertEqual(3, len(c09_registration["candidates"]))
+        self.assertTrue(all(candidate["candidate_grade"] == "hypothetical_candidate" for candidate in c09_registration["candidates"]))
+        self.assertTrue(any("r_i[ngksi_uplink] - 7" in candidate["update_tree_text"] for candidate in c09_registration["candidates"]))
+        self.assertEqual("r' = r", by_edge["E0076"]["candidates"][0]["update_tree_text"])
+        self.assertIn("unknown/unanchored_signal_context", by_edge["E0086"]["candidates"][0]["update_tree_text"])
+        self.assertEqual("r' = r", by_edge["E0112"]["candidates"][0]["update_tree_text"])
+        self.assertEqual("r' = r", by_edge["E0127"]["candidates"][0]["update_tree_text"])
+        self.assertEqual("relatively_stable_candidate", by_edge["E0127"]["candidates"][0]["candidate_grade"])
+        self.assertIn("if r < 6:\n    r' = r + 1", by_edge["E0133"]["candidates"][0]["update_tree_text"])
+        self.assertIn("unknown/unanchored_signal_context", by_edge["E0134"]["candidates"][0]["update_tree_text"])
+        self.assertEqual("r' = r", by_edge["E0196"]["candidates"][0]["update_tree_text"])
+        self.assertEqual("r' = r", by_edge["E0051"]["candidates"][0]["update_tree_text"])
+        self.assertIn("unknown/unanchored_signal_context", by_edge["E0062"]["candidates"][0]["update_tree_text"])
+        self.assertEqual("r' = r", by_edge["E0064"]["candidates"][0]["update_tree_text"])
+        self.assertEqual(3, len(by_edge["E0109"]["candidates"]))
+        self.assertTrue(any("r_i[ngksi_uplink] - 6" in candidate["update_tree_text"] for candidate in by_edge["E0109"]["candidates"]))
+        self.assertEqual(3, len(by_edge["E0110"]["candidates"]))
+        self.assertTrue(any("r_i[ngksi_uplink] + 1" in candidate["update_tree_text"] for candidate in by_edge["E0110"]["candidates"]))
+        self.assertEqual("r' = r", by_edge["E0124"]["candidates"][0]["update_tree_text"])
+        self.assertEqual("r' = r", by_edge["E0174"]["candidates"][0]["update_tree_text"])
+        self.assertTrue(any("r' = r - 1" in candidate["update_tree_text"] for candidate in by_edge["E0181"]["candidates"]))
+        self.assertIn("unknown/unanchored_signal_context", by_edge["E0182"]["candidates"][0]["update_tree_text"])
+        self.assertEqual(3, len(by_edge["E0193"]["candidates"]))
+        self.assertTrue(any("r_i[ngksi_uplink] + 1" in candidate["update_tree_text"] for candidate in by_edge["E0203"]["candidates"]))
+
+    def test_v3_last_write_projection_preserves_raw_observations(self) -> None:
+        first_signal = _signal(1, symbol="registrationRequestGUTI")
+        second_signal = _signal(0, symbol="registrationRequest")
+        first_input = {**_input(7, symbol="registrationRequestGUTI"), "input_register_id": "ngksi_uplink", "definition_id": "guti"}
+        second_input = {**_input(7, symbol="registrationRequest"), "input_register_id": "ngksi_uplink", "definition_id": "regular"}
+        snapshot = effective_snapshot([first_signal, first_input, second_signal, second_input])
+        self.assertEqual([0], [item["value"] for item in snapshot["signals"]])
+        self.assertEqual([7], [item["value"] for item in snapshot["numeric_inputs"]])
+        self.assertEqual("registrationRequest", snapshot["numeric_inputs"][0]["input_symbol"])
+        self.assertEqual(2, snapshot["overwritten_count"])
+        self.assertEqual(1, len(snapshot["numeric_inputs"][0]["overwrites"]))
+
+    def test_v3_input_register_assignment_hold_and_unobservable(self) -> None:
+        event = {"numeric_inputs": [{"input_register_id": "ngksi_uplink", "definition_id": "reg", "input_symbol": "registrationRequest", "field_path": "ue_side.fields.ksi", "value": 7}]}
+        updates = v3_input_register_updates(event, ["ngksi_uplink", "other"], {"ngksi_uplink"})
+        self.assertEqual("input_assignment", updates[0]["update"]["kind"])
+        self.assertEqual("unobservable_input_register", updates[1]["observability"])
+        held = v3_input_register_updates({"numeric_inputs": []}, ["ngksi_uplink"], {"ngksi_uplink"})
+        self.assertEqual("input_hold", held[0]["update"]["kind"])
+
+    def test_v3_numeric_selector_order_and_multiple_registers(self) -> None:
+        definitions = [
+            {"id": "first", "input_register_id": "first_register", "path": "ue_side.fields.first", "value_type": "integer", "match": {"input_symbols": ["*"]}, "phase": "before_register_updates"},
+            {"id": "second", "input_register_id": "second_register", "path": "ue_side.fields.second", "value_type": "integer", "match": {"input_symbols": ["registrationRequest", "serviceRequest"]}, "phase": "before_register_updates"},
+        ]
+        validate_numeric_input_definitions({"numeric_input_definitions": definitions})
+        record = {"_trace_line": 1, "step_id": 4, "ue_side": {"fields": {"first": 7, "second": 3}}}
+        observations = numeric_input_observations(record, {"logical_input": "registrationRequest"}, definitions)
+        self.assertEqual(["first_register", "second_register"], [item["input_register_id"] for item in observations])
+        updates = v3_input_register_updates({"numeric_inputs": observations}, ["first_register", "second_register"], {"first_register", "second_register"})
+        self.assertEqual(["input_assignment", "input_assignment"], [item["update"]["kind"] for item in updates])
+
+    def test_v3_unanchored_signal_default_uses_s_equals_one(self) -> None:
+        tree = default_signal_tree([{
+            "signal_id": "initial", "field_path": "ue_side.fields.initial", "input_symbol": "registrationRequest", "occurrence_index": 0,
+        }])
+        self.assertEqual(1, tree["guard"]["value"])
+        self.assertEqual("unanchored_signal_context", tree["true"]["reason"])
+        self.assertEqual("r' = r", tree_text(tree)[tree_text(tree).rfind("\n") + 1:].strip())
+
+    def test_v3_unanchored_event_assigns_local_occurrence_indexes(self) -> None:
+        signal = _signal(1)
+        numeric = _input(7)
+        signal.pop("occurrence_index")
+        numeric.pop("occurrence_index")
+        event = {
+            "sequence_line": 9, "repetition": 2,
+            "edge": {"edge_id": "E-unanchored"},
+            "signals": [signal], "numeric_inputs": [numeric],
+        }
+
+        sample = standalone_event_sample(event)
+
+        self.assertNotIn("occurrence_index", event["signals"][0])
+        self.assertEqual(0, sample["signals"][0]["occurrence_index"])
+        self.assertEqual(0, sample["inputs"][0]["occurrence_index"])
+        self.assertEqual("initial", stable_slots([sample], "signal")[0]["signal_id"])
 
     def test_cross_cycle_regions_keep_two_edges_separate_and_force_signal_gate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

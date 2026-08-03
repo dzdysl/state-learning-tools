@@ -21,8 +21,9 @@ AMF 下行消息为边界，构造区域：
 ```
 
 - `r_before` 是前一个下行 KSI 观察；
-- `r_after` 是终止下行 KSI 观察；终止消息所属的具体 DOT 边是待拟合边；
-- 中间观察项按实际轨迹事件顺序保留；第 1 轮用于建立锚点，重复 2–10 是拟合样本。
+- `r_after` 是终止下行 KSI 观察；终止消息所属的具体 DOT 边是候选拟合边；
+- 中间观察项按实际轨迹事件顺序保留；第 1 轮用于建立锚点。schema v3 中第 2 轮还用于初始化输入寄存器，
+  含输入寄存器的循环由第 3–10 轮拟合。
 
 该选择承认黑盒限制：无法断言 AMF 在区域中的哪一个内部时刻写寄存器；这里只把终止下行字段作为
 该区域的更新后观测。
@@ -51,11 +52,20 @@ AMF 下行消息为边界，构造区域：
 
 ## 配置接口
 
-数值输入可以为每个逻辑输入配置一个路径或有序路径列表。信号使用通用选择器声明，而不是在代码中
-硬编码 `registrationRequest` 等消息名：
+schema v3 的数值输入与信号都使用通用选择器，而不是在代码中硬编码 `registrationRequest` 等消息名：
 
 ```yaml
 mapping:
+  numeric_input_definitions:
+    - id: registration_ngksi
+      input_register_id: ngksi_uplink
+      path: ue_side.fields.registration_ksi_value
+      value_type: integer
+      match:
+        input_symbols:
+          - registrationRequest
+          - registrationRequestGUTI
+      phase: before_register_updates
   signal_definitions:
     - id: initial_uplink_context
       path: ue_side.fields.isInitMsg
@@ -67,8 +77,10 @@ mapping:
       phase: before_numeric_inputs
 ```
 
-`input_symbols` 可为任意消息列表，或单独使用 `"*"` 通配全部逻辑输入；同一消息可带多个信号，
-同一信号可应用到多个消息。选择器不匹配时，即便字段存在也不会采集。
+`input_symbols` 可为任意消息列表，或单独使用 `"*"` 通配全部逻辑输入；同一消息可带多个信号或数值
+输入。`id` 标识具体字段定义，`input_register_id` 标识显式共享的同类型输入寄存器；选择器不匹配时，即便
+字段存在也不会采集。原始字段在不同消息中仍是不同观测项，但同一 `input_register_id` 的最后事件值可作为
+边后有效输入值，且覆盖链必须保留。
 
 `isInitMsg` 在方法文字中称为“初始上行传输上下文信号”：它不是 NAS PDU 内显式 IE，
 而是随上行传输入口可观察的上下文。它可作为 AMF 处理可能依赖的外生输入，但不应被误写成 AMF
@@ -81,7 +93,7 @@ mapping:
 ```text
 r' = c
 r' = r + k
-r' = ij + k
+r' = r_i + k
 ```
 
 其中 `c`、`k` 均由已观察样本确定。模型树严格区分三种 guard，避免把不同证据语义混为一谈。
@@ -89,10 +101,10 @@ r' = ij + k
 1. `signal_guard`：外生上下文门控，`ite(sj == 1, f1, f2)`。
    所有已配置且实际出现在区域中的信号都强制成为外层节点，即使当前样本中恒为 0 或恒为 1。
 2. `threshold_guard`：回绕的直接观察模型，`ite(x < T, f, 0)`。
-   `x` 为 `r` 或某个输入槽，`T` 必须是轨迹中观察到的值，且 `else` 固定为常数 0。
+    `x` 为 `r` 或某个输入寄存器，`T` 必须是轨迹中观察到的值，且 `else` 固定为常数 0。
    这不是一般性的模运算断言，也不会输出显式 `mod` 公式。
-3. `derived_value_guard`：反例驱动的输入特殊值分裂，`ite(ij == v, f1, f2)`。
-   它只在基础叶子与阈值树均失败后启用；`v` 只从数值输入槽的观测值枚举，两个分支均必须非空并各自满足
+3. `derived_value_guard`：反例驱动的输入特殊值分裂，`ite(r_i == v, f1, f2)`。
+    它只在基础叶子与阈值树均失败后启用；`v` 只从数值输入寄存器的观测值枚举，两个分支均必须非空并各自满足
    最小连续支持。数值 7 因此不会自动获得任何协议语义。
 
 深度独立控制：
@@ -106,15 +118,29 @@ r' = ij + k
 ## 候选保留、未知与索引
 
 在每个已观察信号组合下，先找所有精确叶子；失败才尝试阈值树；两者均失败才尝试派生值分裂。
-所有精确并列项都保留，不能仅因 `r'=r` 比 `r'=i0+1` 简洁就丢弃后者。
+所有精确并列项都保留，不能仅因 `r'=r` 比 `r'=r_i+1` 简洁就丢弃后者。
 
 - 信号组合从未出现：`unknown/unobserved_signal_branch`；
 - 分支样本的连续支持不足：`unknown/insufficient_support`；
 - 含任一未知叶子：`partial_observational_candidate`；
 - 全部叶子由充分样本精确解释：`observationally_exact_candidate`。
 
-结果中的 `candidate_index` 以有序 `guard_path + update_tree + status` 聚合具体 DOT 边集合；
-相同候选在多个边上出现时共享同一索引项，但每个边的区域证据仍完整保留。
+结果中的 `candidate_index` 以有序 `guard_path + update_tree + input_register_updates + status + grade`
+聚合具体 DOT 边集合；相同候选在多个边上出现时共享同一索引项，但每个边的区域与覆盖证据仍完整保留。
+
+### 假设性候选的交集、分歧与冲突
+
+对 `hypothetical_candidate`，顶层 `candidates` 仍有严格含义：它只包含对该边**全部**已对齐样本精确成立的
+全局交集，且仍是唯一进入 `candidate_index` 的候选集合。多边区域的分解不能因为局部样本支持某个公式，就
+把该公式误标为整个 DOT 边的确定更新。
+
+同时，结果中的 `hypothetical_reconciliation` 按 `cycle_id` 保存每个循环分区的局部模型树、跨分区
+`intersection_candidates` 与 `non_consensus_candidates`。局部候选只说明该分区在当前拆分假设下的解释，
+即使全局交集为空也必须保留，以便后续后缀、额外信号或源码对照反驳、合并或细化它们。
+
+冲突的判定比“公式不相同”更严格：只有同一完整类型化观察键（`r_before`、带字段身份和出现序号的信号与
+数值输入、输入寄存器值）实际对应多个 `r_after` 时，才输出 `confirmed_observational_conflict` 及全部证据。
+若局部公式不同而观察键未重叠，则仅为 `partition_divergent`；两种信息均保留，算法不得任意挑选一棵树。
 
 ## 结构性弱先验
 
@@ -141,6 +167,52 @@ C01–C05 验证了常值信号门控、信号外嵌回绕树、未知分支、�
 
 真正的泛化结论仍应使用留出轨迹或循环外轨迹检验，并对照该次运行对应的 AMF 与 UERANSIM/SUL
 源码版本；源代码对照可提高解释置信度，但不改变候选推断本身的观察性性质。
+
+## 边级候选、最后写入投影与输入寄存器
+
+### 有限观察基而非实现寄存器数量断言
+
+已完成的 Mealy 学习将访问前缀约简为有限控制状态，但这并不严格推出真实 AMF 的寄存器数量有限。
+它只说明：在选定输入字母表、查询预算和观测字段下，前缀后的可见行为可由有限观察等价类描述。
+本算法据此采用较弱假设：仅配置并建模有限个由 SUL/UE 观测支持的寄存器类型；任何未被这些字段
+区分的内部状态仍是不可辨识部分。结果必须称为启发式符号寄存器候选，而非对实现存储布局的证明。
+
+### schema v3：显式输入寄存器身份
+
+`numeric_input_definitions` 中的 `id` 标识一个具体消息字段，而 `input_register_id` 标识其所属的逻辑
+输入寄存器。多个输入符号可显式写入同一个 `input_register_id`，例如普通注册与 GUTI 注册的 ngKSI 都
+写入 `ngksi_uplink`。这种同类关系来自 YAML，而非由相同路径或相同消息名隐式猜测。
+
+同一类型信号（同一 signal ID）或数值输入（同一 input-register ID）在区域内按轨迹事件顺序采用最后
+写入值。原始观察项不删除；结果同时给出 `effective_region_snapshot`、每项覆盖链和每条边后的
+`effective_edge_snapshot`。因此 C04 E0073 的原始区域
+
+```text
+(0,{GUTI.isInitMsg=1},[GUTI.ksi=7],{reg.isInitMsg=0},[reg.ksi=7],0)
+```
+
+可被审计地投影为该末端边的 `(0,{isInitMsg=0},[ngksi_uplink=7],0)`，而前一事件仍保留为独立边的
+证据。
+
+### 输入寄存器更新顺序
+
+每个 `input_register_id` 对应输入寄存器 \(r_i\)。含该输入的边先执行 \(r_i'=i\)，无该输入的边执行
+\(r_i'=r_i\)，再对下行可见寄存器 \(r\) 拟合 `r'=c`、`r'=r+k` 或 `r'=r_i+k`。第 2 轮用于输入寄存器
+初始化，含该类型输入的循环从第 3 轮起参与拟合；整个循环未出现该类型则报告
+`unobservable_input_register`。当前阶段不因常规强制信号门控而任意为 \(r_i\) 添加常数叶子；只有后续
+跨边传播出现反例时，才允许提出信号条件赋值候选。
+
+### 区域到边的候选等级
+
+区域恰好只包含一条 DOT 边，且该边的已观察样本精确满足时，输出
+`relatively_stable_candidate`。该等级不消除 `unknown` 信号分支，也不证明源码实现，只表示本边的已观察
+证据没有使用跨边分配假设。
+
+区域含多条边时，算法把末端、携带下行锚点的边作为拟合边；前序无锚点边暂取最简 `r'=r`。前序边若
+还携带信号，则固定为 `ite(s=1,unknown,r)`，而输入寄存器照常赋值。所有这些边均标记
+`hypothetical_candidate`，并携带 `region_to_edge_decomposition`、`last_write_projection` 或
+`minimal_predecessor_default` 等假设来源。信号 guard 统一使用 `ite(s=1,\ldots,\ldots)`；候选等级与
+`observationally_exact_candidate` / `partial_observational_candidate` 的观测状态独立保存。
 
 ## 从边局部候选到跨边等价重构
 

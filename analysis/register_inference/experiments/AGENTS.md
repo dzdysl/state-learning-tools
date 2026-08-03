@@ -1,77 +1,40 @@
-# Experimental ngKSI inference rules
+# 实验性 ngKSI 寄存器推断规则
 
-These rules apply to experimental scripts and analyses in this directory. They
-are deliberately weak, protocol-informed candidate priors for black-box NAS
-inference, not confirmed claims about an AMF implementation.
+本目录脚本与分析仅生成弱协议先验支持的黑盒候选，不得将候选表述为 AMF 实现变量、源码更新点或协议事实。
 
-## Candidate rules
+## 观测与候选边界
 
-1. For this initial candidate workflow, an AMF downlink that carries an
-   ngKSI-related value is the updated-register observation for the inference
-   region that ends at that edge: `r_after = downlink_ksi`. Do not infer a
-   separate pre-update output interpretation in this workflow.
-2. When a state-classified model has a non-self-loop transition whose target is
-   a D-class state, include `r' = 7` as a candidate security-context reset for
-   that edge. This candidate has higher priority than the no-observation
-   default, but remains unconfirmed until a later trace field tests it.
-3. When neither the input nor the output of a transition carries an
-   ngKSI-related value, include `r' = r` as the default candidate. Absence of
-   an observation is not proof that the register did not change, so retain this
-   as a candidate and constrain it with later observations. If this rule and
-   rule 2 both apply, rule 2's D-state reset candidate `r' = 7` has higher
-   priority; do not treat the no-observation default as the preferred
-   explanation for that transition.
-4. Apply the repeated-cycle alignment and inference-region rules to every
-   selected cycle-cover route, not only to C01. Anchor the fitted repetitions
-   with the final observable downlink KSI of repetition 1.
-5. Represent an inference region as `(r_before, ordered_observation_items,
-   r_after)`.  Every item must retain its type, field path, logical input,
-   occurrence index and trace position.  Do not replace a missing, duplicated,
-   reordered or identity-mismatched slot by shifting another observation.
-6. Configure transport-context signals through `mapping.signal_definitions`.
-   Signal selection is data-driven: `match.input_symbols` accepts an arbitrary
-   list or the sole wildcard `"*"`; inference code must not hard-code message
-   names.  Within one event, emit signals in declaration order before numeric
-   inputs.  The same field on different logical messages remains a different
-   slot.
-7. Build all configured, observed signal slots as outer `signal_guard` nodes,
-   including constant-valued signals.  Use explicit `unknown` leaves for
-   unobserved or insufficiently supported branches.  A tree with an unknown
-   leaf is partial, not observationally exact.
-8. Keep node semantics separate: `signal_guard` uses `s == 0/1`;
-   `threshold_guard` models an observed wrap as `x < T` with a fixed constant
-   zero else leaf; `derived_value_guard` is an input-slot equality introduced
-   only after leaves and threshold trees fail.  A derived value has no
-   protocol meaning by itself.
-9. Manage depth independently: configured signal depth is outside the numeric
-   depth budget; `max_numeric_depth` and `max_derived_signal_depth` are separate
-   limits.  An automatically derived equality split must have non-empty sides,
-   minimum consecutive support on both sides, and may enumerate only numeric
-   input slots.
-10. Retain every exact tie among `r'=c`, `r'=r+k`, and `r'=ij+k`, and every
-    exact tied tree.  Index candidates by their ordered guard paths, complete
-    update tree and candidate status, with the corresponding concrete DOT edge
-    set.
+1. 当前工作流把携带 ngKSI 的 AMF 下行字段视为所属区域的更新后 `r_after` 观测；不在本工作流中推断它是更新前字段。
+2. 有限 Mealy 观察等价类不证明真实 AMF 寄存器数量有限。算法只对配置的、可由 SUL/UE 观测支持的有限寄存器基生成候选；其余内部状态保持未建模。
+3. 非自环且目标为 D 类状态的边可保留 `r'=7` 重置候选，优先级高于无观测保持候选；它仍是未确认先验。
+4. 输入、输出均无 ngKSI 观测的边可保留 `r'=r` 最简候选；缺失观测不是寄存器未变的证明。
 
-## Deferred rules
+## 类型化观察与 schema v3
 
-- Do not currently add `r' = i` or `r' = r` merely because a UE uplink carries
-  an ngKSI-related value. The candidate generator may still discover an exact
-  data-driven leaf such as `r' = i + k`.
-- Do not assign `ngKSI = 7` any NAS semantic meaning in this workflow. Treat
-  every observed integer, including `7`, as a raw value; never use it to fill a
-  missing field.
-- Do not emit explicit modulo formulas. Express observed wrap or reset behavior
-  through a tree guard `r < K` or `i < K`, where `K` is observed in the trace.
-  For every such tree, the non-guard (`else`) leaf is fixed to the constant
-  `r' = 0`; do not enumerate another fitted leaf for that branch.
+1. 推断区域保持原始 `(r_before, ordered_observation_items, r_after)`，每项保留类型、字段路径、逻辑输入、事件位置、轨迹行和出现序号。缺失、重复、乱序或身份不一致时报告异常，不得移位补齐。
+2. schema v3 使用 `mapping.numeric_input_definitions`。每个定义具有唯一 `id`、整数路径、消息选择器和 `input_register_id`；相同 `input_register_id` 明确表示同类型输入，而不是由消息名隐式猜测。
+3. 同一信号 ID 或输入寄存器 ID 在一个区域内按事件时序采用最后写入值。原始观察、覆盖链和来源消息必须同时保留；覆盖投影不能删除或改写原始证据。
+4. 信号定义仍由 `mapping.signal_definitions` 驱动，消息选择器可为任意列表或唯一通配符 `"*"`。同一事件中信号按声明顺序位于数值输入之前。
 
-## Evidence and reporting boundaries
+## 输入寄存器与边级归属
 
-- Keep UE-internal observations (for example `ue_sec_ctx_ngksi`) distinct from
-  AMF-visible NAS fields such as `registration_ksi_value`,
-  `auth_request_ksi_value`, and `smc_ksi_value`.
-- Report candidate equations, counterexamples, alignment anomalies, and the
-  ambiguity between output and internal update separately. A fitted equation
-  describes observed behaviour; it does not establish an AMF source-level
-  register name or implementation path.
+1. 每个 `input_register_id` 对应一个输入寄存器 `r_i`。新输入在该边其他寄存器更新前写入：有输入为 `r_i'=i`，无输入为 `r_i'=r_i`。某循环从未出现该类型时标记 `unobservable_input_register`。
+2. 输入寄存器以第 2 轮初始化；有该类输入的循环从第 3 轮开始拟合。除非跨边传播出现反例，本轮不得仅因信号存在而为 `r_i` 枚举常数分支。
+3. 单边区域的已观察样本精确候选标记 `relatively_stable_candidate`；该标签只说明该边已观察分支相对稳定，未观察信号分支仍可为 `unknown`。
+4. 多边区域采用“前序边最简、末端可观察边拟合”时，所有拆分结果标记 `hypothetical_candidate`，并记录 `region_to_edge_decomposition`、最后写入投影及最简默认等假设来源。
+5. 无下行锚点的前序边默认 `r'=r`。若它带输入和信号，使用 `ite(s=1, unknown, r)`，同时仍记录输入寄存器赋值。
+
+## 模型树规则
+
+1. 所有信号节点统一为 `ite(s=1, true_branch, false_branch)`；不以 `s=0` 作为正向 guard。
+2. `threshold_guard` 只表示可观察回绕结构 `ite(x<T,f,0)`，否则叶固定为常数 0；不显式声称一般模运算。
+3. `derived_value_guard` 仅在基础叶和阈值树均失败后，从具有充分连续支持的输入寄存器值中枚举；整数 `7` 不自动具有协议语义。
+4. 保留 `r'=c`、`r'=r+k`、`r'=r_i+k` 及所有精确并列树。`observationally_exact_candidate` 与 `partial_observational_candidate` 是观测状态，必须和候选等级分开记录。
+5. 对 `hypothetical_candidate`，`candidates` 仍只保存跨全部已对齐样本精确成立的交集；同时必须保留按循环分区的局部候选、交集、非共识候选及同一类型化观察键对应多个 `r_after` 的冲突证据。局部候选不得混入全局 `candidate_index`，也不得因全局交集为空而删除。
+
+## 报告边界
+
+- 候选应同时报告公式、对齐异常、覆盖链、拆分假设、未观察分支和可用反例。
+- 假设性分区的公式差异但没有相同观察键的不同输出时，标为分区分歧；相同完整观察键出现不同输出时，标为观察冲突。两者都保留，不得任意选择其中一个公式。
+- 同一消息或同一 I/O 标签只能提出共享语义候选，不能直接证明 AMF 使用同一个源码处理函数。
+- 循环内精确性与循环外泛化必须分开；共享或拆分结论应由后续后缀、留出轨迹及对应版本源码对照继续检验。
