@@ -9,6 +9,8 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, replace
@@ -125,6 +127,56 @@ class AnalysisResult:
     signal_mode: SignalMode
     used_closed_walk_fallback: bool
     excluded_states: frozenset[str]
+
+
+@dataclass(frozen=True)
+class TargetEdge:
+    """One concrete SMP transition to cover, including parallel state-pair edges."""
+
+    target_id: str
+    transition: Transition
+
+
+@dataclass(frozen=True)
+class Route:
+    """A concrete executable closed route, optionally with an inserted self-loop."""
+
+    route_id: str
+    route_kind: str
+    nodes: tuple[str, ...]
+    edges: tuple[Transition, ...]
+    target_ids: frozenset[str]
+    embedded_loop: Transition | None = None
+    embedded_at_index: int | None = None
+
+    @property
+    def length(self) -> int:
+        return len(self.edges)
+
+    @property
+    def walk_type(self) -> str:
+        if len(set(self.nodes)) == len(self.nodes):
+            return "simple_directed_cycle"
+        return "composite_closed_walk"
+
+
+@dataclass(frozen=True)
+class LayeredAnalysis:
+    target_model: DotModel
+    closure_model: DotModel
+    targets: tuple[TargetEdge, ...]
+    input_warnings: tuple[dict[str, Any], ...]
+    required_inputs: frozenset[str]
+    required_outputs: frozenset[str]
+    signal_mode: SignalMode
+    excluded_states: frozenset[str]
+    simple_candidates: tuple[Route, ...]
+    fallback_candidates: tuple[Route, ...]
+    base_simple_routes: tuple[Route, ...]
+    base_fallback_routes: tuple[Route, ...]
+    standalone_self_loops: tuple[Route, ...]
+    extra_short_routes: tuple[Route, ...]
+    extra_embedded_routes: tuple[Route, ...]
 
 
 def state_key(state: str) -> tuple[int, int | str, str]:
@@ -1099,6 +1151,396 @@ def analyze_cycle_cover(
     )
 
 
+def concrete_edge_key(edge: Transition) -> tuple[str, str, str, str, int]:
+    """Identity for coverage/reuse accounting; keeps parallel DOT edges distinct."""
+    return (edge.kind, edge.src, edge.dst, edge.label, edge.order)
+
+
+def route_sort_key(route: Route) -> tuple[Any, ...]:
+    return (
+        route.length,
+        tuple(state_key(state) for state in route.nodes),
+        tuple((edge.label, edge.order, edge.kind) for edge in route.edges),
+        route.embedded_at_index if route.embedded_at_index is not None else -1,
+        route.embedded_loop.label if route.embedded_loop else "",
+        route.embedded_loop.order if route.embedded_loop else -1,
+    )
+
+
+def assign_route_ids(routes: Iterable[Route], prefix: str) -> tuple[Route, ...]:
+    ordered = sorted(routes, key=route_sort_key)
+    return tuple(
+        replace(route, route_id=f"{prefix}{index:03d}")
+        for index, route in enumerate(ordered, start=1)
+    )
+
+
+def route_edge_usage(routes: Iterable[Route]) -> Counter[tuple[str, str, str, str, int]]:
+    usage: Counter[tuple[str, str, str, str, int]] = Counter()
+    for route in routes:
+        usage.update(concrete_edge_key(edge) for edge in route.edges)
+    return usage
+
+
+def route_repeat_count(usage: Counter[tuple[str, str, str, str, int]]) -> int:
+    return sum(max(count - 1, 0) for count in usage.values())
+
+
+def select_routes_exact(
+    candidates: Sequence[Route],
+    required_target_ids: frozenset[str],
+    initial_usage: Counter[tuple[str, str, str, str, int]] | None = None,
+) -> tuple[tuple[Route, ...], Counter[tuple[str, str, str, str, int]]]:
+    """Exact lexicographic cover over a supplied, already bounded route pool."""
+    if not required_target_ids:
+        usage = initial_usage.copy() if initial_usage is not None else Counter()
+        return (), usage
+    eligible = tuple(
+        route for route in candidates if route.target_ids.intersection(required_target_ids)
+    )
+    options: dict[str, tuple[int, ...]] = {}
+    for target_id in sorted(required_target_ids):
+        indexes = tuple(
+            index for index, route in enumerate(eligible) if target_id in route.target_ids
+        )
+        if not indexes:
+            raise CycleCoverError(f"No eligible route covers target {target_id}.")
+        options[target_id] = indexes
+
+    initial = initial_usage.copy() if initial_usage is not None else Counter()
+    best_indexes: frozenset[int] | None = None
+    best_key: tuple[int, int, int, int, tuple[str, ...]] | None = None
+    seen: set[frozenset[int]] = set()
+
+    def search(
+        selected: frozenset[int],
+        covered: frozenset[str],
+        usage: Counter[tuple[str, str, str, str, int]],
+        max_length: int,
+        total_length: int,
+    ) -> None:
+        nonlocal best_indexes, best_key
+        if selected in seen:
+            return
+        seen.add(selected)
+        if covered >= required_target_ids:
+            key = (
+                max_length,
+                len(selected),
+                route_repeat_count(usage),
+                total_length,
+                tuple(eligible[index].route_id for index in sorted(selected)),
+            )
+            if best_key is None or key < best_key:
+                best_key = key
+                best_indexes = selected
+            return
+
+        uncovered = required_target_ids - covered
+        pivot = min(
+            uncovered,
+            key=lambda target_id: (
+                len([index for index in options[target_id] if index not in selected]),
+                target_id,
+            ),
+        )
+        branch = [index for index in options[pivot] if index not in selected]
+        branch.sort(
+            key=lambda index: (
+                -len(eligible[index].target_ids.intersection(uncovered)),
+                eligible[index].length,
+                eligible[index].route_id,
+            )
+        )
+        for index in branch:
+            route = eligible[index]
+            new_usage = usage.copy()
+            new_usage.update(concrete_edge_key(edge) for edge in route.edges)
+            new_max = max(max_length, route.length)
+            new_total = total_length + route.length
+            if best_key is not None:
+                optimistic = (new_max, len(selected) + 1, route_repeat_count(new_usage))
+                if optimistic > best_key[:3]:
+                    continue
+            search(
+                selected | {index},
+                covered | route.target_ids.intersection(required_target_ids),
+                new_usage,
+                new_max,
+                new_total,
+            )
+
+    search(frozenset(), frozenset(), initial, 0, 0)
+    if best_indexes is None:
+        raise CycleCoverError("Exact route-cover search found no solution.")
+    selected = tuple(eligible[index] for index in sorted(best_indexes))
+    usage = initial.copy()
+    usage.update(
+        concrete_edge_key(edge) for route in selected for edge in route.edges
+    )
+    return selected, usage
+
+
+def rotate_route_to_minimum_state(
+    route: Route,
+) -> tuple[str, tuple[str, ...], tuple[Transition, ...], int | None]:
+    if not route.nodes or len(route.nodes) != len(route.edges):
+        raise CycleCoverError(f"Route {route.route_id} has no contiguous closed walk.")
+    minimum_index = min(
+        range(len(route.nodes)), key=lambda index: state_number(route.nodes[index])
+    )
+    nodes = route.nodes[minimum_index:] + route.nodes[:minimum_index]
+    edges = route.edges[minimum_index:] + route.edges[:minimum_index]
+    for index, edge in enumerate(edges):
+        if edge.src != nodes[index] or edge.dst != nodes[(index + 1) % len(nodes)]:
+            raise CycleCoverError(f"Route {route.route_id} is not contiguous.")
+    embedded_at = None
+    if route.embedded_at_index is not None:
+        embedded_at = (route.embedded_at_index - minimum_index) % len(nodes)
+    return nodes[0], nodes, edges, embedded_at
+
+
+def layered_target_edges(
+    target_model: DotModel,
+) -> tuple[tuple[TargetEdge, ...], tuple[dict[str, Any], ...]]:
+    by_pair: dict[tuple[str, str], list[Transition]] = defaultdict(list)
+    for edge in target_model.edges:
+        by_pair[edge.pair].append(replace(edge, kind="target"))
+    warnings: list[dict[str, Any]] = []
+    for pair, edges in sorted(by_pair.items(), key=lambda item: (state_key(item[0][0]), state_key(item[0][1]))):
+        if len(edges) > 1:
+            warnings.append(
+                {
+                    "code": "parallel_target_state_pair",
+                    "pair": list(pair),
+                    "labels": [edge.label for edge in edges],
+                    "message": "SMP target DOT has parallel concrete edges; each is covered independently.",
+                }
+            )
+    targets = tuple(
+        TargetEdge(f"E{index:03d}", replace(edge, kind="target"))
+        for index, edge in enumerate(target_model.edges, start=1)
+    )
+    return targets, tuple(warnings)
+
+
+def build_layered_analysis(
+    dot_path: Path,
+    closure_dot_path: Path,
+    excluded_states: Iterable[str],
+    required_inputs: Iterable[str],
+    required_outputs: Iterable[str],
+    signal_mode: SignalMode = "output-only",
+    max_candidates: int = 100_000,
+) -> LayeredAnalysis:
+    if signal_mode not in SIGNAL_MODES:
+        raise CycleCoverError(f"Unknown signal mode: {signal_mode}")
+    excluded = frozenset(excluded_states)
+    required_input_set = frozenset(required_inputs)
+    required_output_set = frozenset(required_outputs)
+    target_model = filter_model(parse_dot(dot_path), excluded)
+    closure_model = filter_model(parse_dot(closure_dot_path), excluded)
+    targets, warnings = layered_target_edges(target_model)
+    target_by_pair: dict[tuple[str, str], list[TargetEdge]] = defaultdict(list)
+    for target in targets:
+        target_by_pair[target.transition.pair].append(target)
+
+    closure_by_pair: dict[tuple[str, str], list[Transition]] = defaultdict(list)
+    for edge in closure_model.edges:
+        closure_by_pair[edge.pair].append(replace(edge, kind="closure"))
+    missing = [pair for pair in target_by_pair if pair not in closure_by_pair]
+    if missing:
+        raise CycleCoverError(
+            "Target edges are missing from the closure graph by state pair: "
+            + ", ".join(f"{src}->{dst}" for src, dst in missing)
+        )
+    chosen_closure = {
+        pair: min(
+            edges,
+            key=lambda edge: (
+                not transition_hits_required_signal(
+                    edge, required_input_set, required_output_set, signal_mode
+                ),
+                edge.order,
+            ),
+        )
+        for pair, edges in closure_by_pair.items()
+    }
+    adjacency_sets: dict[str, set[str]] = defaultdict(set)
+    for edge in closure_model.edges:
+        adjacency_sets[edge.src].add(edge.dst)
+    adjacency = {
+        state: tuple(sorted(destinations, key=state_key))
+        for state, destinations in adjacency_sets.items()
+    }
+    node_cycles = enumerate_simple_cycles(
+        closure_model.states, adjacency, max_candidates=max_candidates
+    )
+
+    def concrete_routes_for_nodes(nodes: tuple[str, ...]) -> list[Route]:
+        pairs = tuple(
+            (nodes[index], nodes[(index + 1) % len(nodes)])
+            for index in range(len(nodes))
+        )
+        options: list[tuple[tuple[Transition, frozenset[str]], ...]] = []
+        for pair in pairs:
+            parallel_targets = target_by_pair.get(pair)
+            if parallel_targets:
+                options.append(
+                    tuple(
+                        (target.transition, frozenset({target.target_id}))
+                        for target in parallel_targets
+                    )
+                )
+            else:
+                options.append(((chosen_closure[pair], frozenset()),))
+        routes: list[Route] = []
+        for combination in itertools.product(*options):
+            edges = tuple(item[0] for item in combination)
+            target_ids = frozenset().union(*(item[1] for item in combination))
+            if target_ids:
+                routes.append(
+                    Route("", "simple_candidate", nodes, edges, target_ids)
+                )
+        return routes
+
+    raw_simple: list[Route] = []
+    for nodes in node_cycles:
+        raw_simple.extend(concrete_routes_for_nodes(nodes))
+        if len(raw_simple) > max_candidates:
+            raise CycleCoverError(
+                "Simple-cycle concrete candidate generation exceeded "
+                f"--max-candidates={max_candidates}; refusing a partial result."
+            )
+    signal_simple = [
+        route
+        for route in raw_simple
+        if candidate_satisfies_signal(
+            route.edges, required_input_set, required_output_set, signal_mode
+        )
+    ]
+    simple_candidates = assign_route_ids(signal_simple, "S")
+    simple_coverable = frozenset().union(
+        *(route.target_ids for route in simple_candidates)
+    ) if simple_candidates else frozenset()
+    base_simple, simple_usage = select_routes_exact(simple_candidates, simple_coverable)
+    all_target_ids = frozenset(target.target_id for target in targets)
+    residual = all_target_ids - simple_coverable
+
+    def rotate_nodes_at(nodes: tuple[str, ...], anchor: str) -> tuple[str, ...]:
+        index = nodes.index(anchor)
+        return nodes[index:] + nodes[:index]
+
+    fallback_routes: list[Route] = []
+    if residual:
+        signal_by_nodes = [route for route in simple_candidates]
+        seen: set[tuple[Any, ...]] = set()
+        for base in raw_simple:
+            if not base.target_ids.intersection(residual):
+                continue
+            for signal in signal_by_nodes:
+                for anchor in sorted(set(base.nodes).intersection(signal.nodes), key=state_key):
+                    base_nodes = rotate_nodes_at(base.nodes, anchor)
+                    signal_nodes = rotate_nodes_at(signal.nodes, anchor)
+                    base_edges = base.edges[base.nodes.index(anchor):] + base.edges[:base.nodes.index(anchor)]
+                    signal_edges = signal.edges[signal.nodes.index(anchor):] + signal.edges[:signal.nodes.index(anchor)]
+                    route = Route(
+                        "",
+                        "base_fallback",
+                        base_nodes + signal_nodes,
+                        base_edges + signal_edges,
+                        base.target_ids | signal.target_ids,
+                    )
+                    key = (
+                        route.nodes,
+                        tuple(concrete_edge_key(edge) for edge in route.edges),
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    fallback_routes.append(route)
+                    if len(fallback_routes) > max_candidates:
+                        raise CycleCoverError(
+                            "Fallback candidate generation exceeded "
+                            f"--max-candidates={max_candidates}; refusing a partial result."
+                        )
+        fallback_candidates = assign_route_ids(fallback_routes, "F")
+        base_fallback, _ = select_routes_exact(
+            fallback_candidates, residual, initial_usage=simple_usage
+        )
+    else:
+        fallback_candidates = ()
+        base_fallback = ()
+
+    self_loops = tuple(
+        sorted(
+            (
+                edge
+                for edge in closure_model.edges
+                if edge.src == edge.dst
+                and candidate_satisfies_signal(
+                    (edge,), required_input_set, required_output_set, signal_mode
+                )
+            ),
+            key=lambda edge: (state_key(edge.src), edge.order, edge.label),
+        )
+    )
+    standalone_self_loops = tuple(
+        Route(
+            f"L{index:03d}",
+            "base_standalone_self_loop",
+            (edge.src,),
+            (edge,),
+            frozenset(),
+        )
+        for index, edge in enumerate(self_loops, start=1)
+    )
+    extra_short = assign_route_ids(
+        (
+            replace(route, route_kind="extra_short_cycle")
+            for route in simple_candidates
+            if route.length in {3, 4, 5}
+        ),
+        "X",
+    )
+    loops_by_state: dict[str, list[Transition]] = defaultdict(list)
+    for edge in self_loops:
+        loops_by_state[edge.src].append(edge)
+    embedded: list[Route] = []
+    for route in extra_short:
+        for index, state in enumerate(route.nodes):
+            for loop in loops_by_state.get(state, []):
+                embedded.append(
+                    Route(
+                        "",
+                        "extra_embedded_self_loop",
+                        route.nodes,
+                        route.edges,
+                        route.target_ids,
+                        embedded_loop=loop,
+                        embedded_at_index=index,
+                    )
+                )
+    extra_embedded = assign_route_ids(embedded, "I")
+    return LayeredAnalysis(
+        target_model=target_model,
+        closure_model=closure_model,
+        targets=targets,
+        input_warnings=warnings,
+        required_inputs=required_input_set,
+        required_outputs=required_output_set,
+        signal_mode=signal_mode,
+        excluded_states=excluded,
+        simple_candidates=simple_candidates,
+        fallback_candidates=fallback_candidates,
+        base_simple_routes=tuple(replace(route, route_kind="base_simple_cover") for route in base_simple),
+        base_fallback_routes=base_fallback,
+        standalone_self_loops=standalone_self_loops,
+        extra_short_routes=extra_short,
+        extra_embedded_routes=extra_embedded,
+    )
+
+
 def dot_escape(value: str) -> str:
     return value.replace("\\", r"\\").replace('"', r"\"").replace("\n", r"\n")
 
@@ -1117,7 +1559,17 @@ def render_svg(dot_text: str, output: Path, engine: str) -> None:
     executable = resolve_graphviz_engine(engine)
     reproducible_environment = os.environ.copy()
     reproducible_environment["SOURCE_DATE_EPOCH"] = "0"
-    temporary = output.with_name(output.name + ".tmp")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # Windows Graphviz still uses legacy path handling in some builds.  Keep the
+    # renderer's temporary path short, then atomically publish on the same drive.
+    temporary_dir = output.parent
+    if len(str(output)) > 220:
+        temporary_dir = Path(output.resolve().anchor)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix="cyclecover_", suffix=".svg.tmp", dir=temporary_dir
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
     try:
         subprocess.run(
             [executable, "-Tsvg", "-o", str(temporary)],
@@ -1792,6 +2244,387 @@ def generate_outputs(
     return summary
 
 
+def route_payload(route: Route) -> dict[str, Any]:
+    return {
+        "route_id": route.route_id,
+        "route_kind": route.route_kind,
+        "walk_type": route.walk_type,
+        "length": route.length,
+        "nodes": list(route.nodes) + [route.nodes[0]],
+        "target_edge_ids": sorted(route.target_ids),
+        "edges": [
+            {
+                "src": edge.src,
+                "dst": edge.dst,
+                "label": edge.label,
+                "inputs": list(edge.inputs),
+                "output": edge.output,
+                "kind": edge.kind,
+                "order": edge.order,
+            }
+            for edge in route.edges
+        ],
+        "embedded_self_loop": (
+            {
+                "at_route_node_index": route.embedded_at_index,
+                "state": route.embedded_loop.src,
+                "label": route.embedded_loop.label,
+                "inputs": list(route.embedded_loop.inputs),
+                "output": route.embedded_loop.output,
+                "order": route.embedded_loop.order,
+                "repetitions_per_route_iteration": 3,
+            }
+            if route.embedded_loop is not None
+            else None
+        ),
+    }
+
+
+def build_route_sequence_export(
+    analysis: LayeredAnalysis,
+    routes: Sequence[Route],
+    start_state: str,
+    repeat_count: int,
+    merged_input_policy: MergedInputPolicy,
+) -> tuple[list[str], dict[str, Any]]:
+    if repeat_count < 1:
+        raise CycleCoverError("Sequence repeat count must be positive.")
+    if merged_input_policy not in MERGED_INPUT_POLICIES:
+        raise CycleCoverError(f"Unknown merged-input policy: {merged_input_policy}")
+    rotated = [
+        (route, *rotate_route_to_minimum_state(route))
+        for route in routes
+    ]
+    access = shortest_access_traces(
+        analysis.closure_model,
+        start_state,
+        dict.fromkeys(item[1] for item in rotated),
+    )
+    _, transition_by_input = build_deterministic_input_graph(analysis.closure_model)
+    lines: list[str] = []
+    route_entries: list[dict[str, Any]] = []
+    for route, route_start, nodes, edges, embedded_at in rotated:
+        prefix_trace = access[route_start]
+        prefix_inputs = [item[0] for item in prefix_trace]
+        options: list[tuple[str, ...]] = [
+            edge.inputs if merged_input_policy == "expand" else (edge.inputs[0],)
+            for edge in edges
+        ]
+        if any(not choice for choice in options):
+            raise CycleCoverError(f"Route {route.route_id} has an inputless edge.")
+        loop_options = (
+            route.embedded_loop.inputs
+            if route.embedded_loop is not None and merged_input_policy == "expand"
+            else ((route.embedded_loop.inputs[0],) if route.embedded_loop is not None else ((),))
+        )
+        first_line = len(lines) + 1
+        variants: list[dict[str, Any]] = []
+        for edge_inputs in itertools.product(*options):
+            for loop_input_choice in loop_options:
+                loop_input = loop_input_choice if isinstance(loop_input_choice, str) else None
+                current = start_state
+                tokens: list[str] = []
+                for input_symbol, _ in prefix_trace:
+                    actual = transition_by_input.get((current, input_symbol))
+                    if actual is None:
+                        raise CycleCoverError(
+                            f"Access prefix uses undefined transition ({current}, {input_symbol})."
+                        )
+                    tokens.append(input_symbol)
+                    current = actual.dst
+                if current != route_start:
+                    raise CycleCoverError(f"Access prefix does not reach {route_start}.")
+                for _ in range(repeat_count):
+                    for index, (edge, input_symbol) in enumerate(zip(edges, edge_inputs)):
+                        if embedded_at == index and route.embedded_loop is not None:
+                            if loop_input is None:
+                                raise CycleCoverError("Embedded self-loop has no chosen input.")
+                            for _ in range(3):
+                                actual_loop = transition_by_input.get((current, loop_input))
+                                if (
+                                    actual_loop is None
+                                    or actual_loop.src != route.embedded_loop.src
+                                    or actual_loop.dst != route.embedded_loop.dst
+                                ):
+                                    raise CycleCoverError(
+                                        f"Embedded self-loop is undefined at ({current}, {loop_input})."
+                                    )
+                                tokens.append(loop_input)
+                                current = actual_loop.dst
+                        actual = transition_by_input.get((current, input_symbol))
+                        if actual is None or actual.dst != edge.dst or current != edge.src:
+                            raise CycleCoverError(
+                                f"Route {route.route_id} leaves its selected edge at "
+                                f"({current}, {input_symbol})."
+                            )
+                        tokens.append(input_symbol)
+                        current = actual.dst
+                    if current != route_start:
+                        raise CycleCoverError(
+                            f"Route {route.route_id} does not close after one iteration."
+                        )
+                line = " ".join(tokens)
+                if not line or line != line.strip() or "  " in line:
+                    raise CycleCoverError(f"Invalid sequence formatting for {route.route_id}.")
+                lines.append(line)
+                variants.append(
+                    {
+                        "line_number": len(lines),
+                        "route_inputs": list(edge_inputs),
+                        "embedded_self_loop_input": loop_input,
+                        "input_count": len(tokens),
+                    }
+                )
+        route_entries.append(
+            {
+                **route_payload(route),
+                "cycle_start_state": route_start,
+                "rotated_nodes": list(nodes) + [nodes[0]],
+                "prefix_inputs": prefix_inputs,
+                "prefix_length": len(prefix_inputs),
+                "repeat_count": repeat_count,
+                "first_line": first_line,
+                "last_line": len(lines),
+                "variant_count": len(variants),
+                "variants": variants,
+            }
+        )
+    return lines, {
+        "start_state": start_state,
+        "repeat_count": repeat_count,
+        "merged_input_policy": merged_input_policy,
+        "line_count": len(lines),
+        "route_count": len(routes),
+        "routes": route_entries,
+        "validation": {
+            "all_cycle_starts_reachable": True,
+            "all_lines_simulated_against_closure_dot": True,
+            "all_lines_close_after_each_iteration": True,
+            "single_space_delimited_nonempty_lines": True,
+        },
+    }
+
+
+def write_route_sequence_export(
+    analysis: LayeredAnalysis,
+    routes: Sequence[Route],
+    output_path: Path,
+    start_state: str,
+    repeat_count: int,
+    merged_input_policy: MergedInputPolicy,
+    overwrite: bool,
+) -> dict[str, Any]:
+    resolved = output_path.resolve()
+    if resolved.exists() and not overwrite:
+        raise CycleCoverError(f"Sequence output already exists: {resolved}")
+    lines, metadata = build_route_sequence_export(
+        analysis, routes, start_state, repeat_count, merged_input_policy
+    )
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    temporary = resolved.with_name(resolved.name + ".tmp")
+    try:
+        temporary.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+        os.replace(temporary, resolved)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    metadata.update({"path": str(resolved), "bytes": resolved.stat().st_size, "sha256": sha256_file(resolved)})
+    return metadata
+
+
+def build_route_smp_dot(
+    analysis: LayeredAnalysis,
+    basename: str,
+    route: Route,
+    color: str,
+) -> str:
+    source_text = analysis.target_model.path.read_text(encoding="utf-8")
+    candidate_target_labels = {
+        (edge.src, edge.dst, edge.label)
+        for edge in route.edges
+        if edge.kind == "target"
+    }
+    opening = source_text.find("{")
+    closing = source_text.rfind("}")
+    if opening < 0 or closing < 0:
+        raise CycleCoverError(f"Target DOT is malformed: {analysis.target_model.path}")
+    route_text = " → ".join((*route.nodes, route.nodes[0]))
+    attributes = (
+        '\n  graph [overlap=false, splines=true, bgcolor="white", '
+        'fontname="Microsoft YaHei", fontsize=20, labelloc="t", '
+        f'label="{dot_escape(basename)} {route.route_id}｜{dot_escape(route.route_kind)}\\n'
+        f'{dot_escape(route_text)}"];\n'
+    )
+    source_text = source_text[: opening + 1] + attributes + source_text[opening + 1 :]
+
+    def recolor(match: re.Match[str]) -> str:
+        indent, src, dst, attrs = match.groups()
+        label_match = LABEL_RE.search(attrs)
+        label = unescape_dot_label(label_match.group(1)) if label_match else ""
+        if (src, dst, label) in candidate_target_labels:
+            return (
+                f'{indent}{src} -> {dst} [{attrs}, color="{color}", '
+                f'fontcolor="{color}", style="solid", penwidth=4.0];'
+            )
+        return (
+            f'{indent}{src} -> {dst} [{attrs}, color="black", '
+            'fontcolor="black", style="solid", penwidth=1.0];'
+        )
+
+    source_text = EDGE_STATEMENT_RE.sub(recolor, source_text)
+    closing = source_text.rfind("}")
+    additions = [""]
+    closure_edges = [edge for edge in route.edges if edge.kind == "closure"]
+    if route.embedded_loop is not None:
+        closure_edges.append(route.embedded_loop)
+    for edge in sorted({concrete_edge_key(edge): edge for edge in closure_edges}.values(), key=lambda edge: edge.order):
+        additions.append(
+            f'  {edge.src} -> {edge.dst} [label="{dot_escape(edge.label)}", '
+            f'color="{color}", fontcolor="{color}", style="dashed", '
+            'penwidth=4.0, constraint=false];'
+        )
+    return source_text[:closing] + "\n".join(additions) + source_text[closing:]
+
+
+def write_layered_report(payload: dict[str, Any], path: Path) -> None:
+    sequence = payload["sequence_export"]
+    lines = [
+        f"# {payload['basename']} {payload['group_name']}环路线报告",
+        "",
+        "## 输入与约束",
+        "",
+        f"- SMP 目标：`{Path(payload['source_dot']).name}`（完整路径和 SHA-256 见 JSON）",
+        f"- 原始闭环 DOT：`{Path(payload['closure_dot']).name}`（完整路径和 SHA-256 见 JSON）",
+        f"- 信令约束：`{payload['parameters']['signal_match_mode']}`",
+        f"- 具体路线：{len(payload['routes'])}；序列行：{sequence['line_count']}",
+        "- 表格对长路线使用 `→` 分隔；消息对在 `/` 后换行，避免撑宽列。",
+        "",
+        "## 路线与序列",
+        "",
+        "| ID | 类型 | 长度 | 覆盖目标边 | 序列行 | SVG |",
+        "|---|---|---:|---|---:|---|",
+    ]
+    sequence_by_id = {entry["route_id"]: entry for entry in sequence["routes"]}
+    for route in payload["routes"]:
+        sequence_entry = sequence_by_id[route["route_id"]]
+        target_text = ", ".join(route["target_edge_ids"]) or "—"
+        lines.append(
+            f"| {route['route_id']} | {route['route_kind']} | {route['length']} | "
+            f"{target_text} | {sequence_entry['first_line']}–{sequence_entry['last_line']} | "
+            f"[SVG]({route['artifact']['path']}) |"
+        )
+    if payload["input_warnings"]:
+        lines.extend(["", "## 输入警告", ""])
+        for warning in payload["input_warnings"]:
+            lines.append(f"- `{warning['code']}`：`{' → '.join(warning['pair'])}`；" + "；".join(warning["labels"]))
+    if payload.get("fallback_target_ids"):
+        lines.extend(["", "## 基础 fallback", "", "- 仅以下残余目标边由复合闭合游走覆盖：" + ", ".join(payload["fallback_target_ids"])])
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def generate_layered_group(
+    analysis: LayeredAnalysis,
+    routes: Sequence[Route],
+    group_name: str,
+    output_dir: Path,
+    basename: str,
+    sequence_output: Path,
+    start_state: str,
+    repeat_count: int,
+    merged_input_policy: MergedInputPolicy,
+    engine: str,
+    overwrite: bool,
+    fallback_target_ids: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    output = prepare_output_dir(output_dir, basename, overwrite)
+    sequence = write_route_sequence_export(
+        analysis, routes, sequence_output, start_state, repeat_count, merged_input_policy, overwrite
+    )
+    colors = {route.route_id: CYCLE_PALETTE[index % len(CYCLE_PALETTE)] for index, route in enumerate(routes)}
+    route_entries: list[dict[str, Any]] = []
+    for index, route in enumerate(routes, start=1):
+        svg_path = output / "cycles" / f"{basename}_{route.route_id}_len{route.length:02d}.svg"
+        render_svg(build_route_smp_dot(analysis, basename, route, colors[route.route_id]), svg_path, engine)
+        route_entries.append({**route_payload(route), "color": colors[route.route_id], "artifact": artifact_record(svg_path, output)})
+    payload: dict[str, Any] = {
+        "schema_version": 4,
+        "kind": "mealy_layered_cycle_routes",
+        "group_name": group_name,
+        "basename": basename,
+        "source_dot": str(analysis.target_model.path),
+        "source_sha256": sha256_file(analysis.target_model.path),
+        "closure_dot": str(analysis.closure_model.path),
+        "closure_sha256": sha256_file(analysis.closure_model.path),
+        "parameters": {
+            "excluded_states": sorted(analysis.excluded_states, key=state_key),
+            "required_inputs": sorted(analysis.required_inputs),
+            "required_outputs": sorted(analysis.required_outputs),
+            "signal_match_mode": analysis.signal_mode,
+            "sequence_repeat_count": repeat_count,
+            "merged_input_policy": merged_input_policy,
+        },
+        "input_warnings": list(analysis.input_warnings),
+        "target_edges": [
+            {"target_id": target.target_id, **route_payload(Route("", "", (target.transition.src,), (target.transition,), frozenset({target.target_id}))) ["edges"][0]}
+            for target in analysis.targets
+        ],
+        "fallback_target_ids": sorted(fallback_target_ids),
+        "routes": route_entries,
+        "sequence_export": sequence,
+    }
+    report_path = output / f"{basename}_cycle_cover_report.md"
+    write_layered_report(payload, report_path)
+    payload["report_artifact"] = artifact_record(report_path, output)
+    json_path = output / f"{basename}_cycle_cover.json"
+    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return {
+        "group_name": group_name,
+        "route_count": len(routes),
+        "sequence_export": sequence,
+        "artifacts": [str(json_path), str(report_path), *[str(output / entry["artifact"]["path"]) for entry in route_entries], str(sequence_output.resolve())],
+    }
+
+
+def generate_layered_outputs(
+    analysis: LayeredAnalysis,
+    output_dir: Path,
+    basename: str,
+    sequence_output: Path,
+    start_state: str,
+    repeat_count: int,
+    merged_input_policy: MergedInputPolicy,
+    engine: str,
+    overwrite: bool,
+    extra_output_dir: Path | None = None,
+    extra_basename: str | None = None,
+    extra_sequence_output: Path | None = None,
+) -> dict[str, Any]:
+    if (extra_output_dir is None) != (extra_sequence_output is None):
+        raise CycleCoverError("--extra-output-dir and --extra-sequence-output must be supplied together.")
+    base_routes = (
+        analysis.base_simple_routes
+        + analysis.base_fallback_routes
+        + analysis.standalone_self_loops
+    )
+    fallback_targets = frozenset().union(
+        *(route.target_ids for route in analysis.base_fallback_routes)
+    ) - frozenset().union(*(route.target_ids for route in analysis.base_simple_routes)) if analysis.base_fallback_routes else frozenset()
+    summary = {
+        "base": generate_layered_group(
+            analysis, base_routes, "基础", output_dir, basename, sequence_output,
+            start_state, repeat_count, merged_input_policy, engine, overwrite, fallback_targets,
+        )
+    }
+    if extra_output_dir is not None and extra_sequence_output is not None:
+        extra_routes = analysis.extra_short_routes + analysis.extra_embedded_routes
+        summary["extra"] = generate_layered_group(
+            analysis, extra_routes, "额外", extra_output_dir,
+            extra_basename or f"{basename}_extra", extra_sequence_output,
+            start_state, repeat_count, merged_input_policy, engine, overwrite,
+        )
+    return summary
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -1845,6 +2678,20 @@ def parse_args() -> argparse.Namespace:
             "concrete input combination. Default: first."
         ),
     )
+    parser.add_argument(
+        "--extra-output-dir",
+        type=Path,
+        help="Independent output directory for all additional short-cycle routes.",
+    )
+    parser.add_argument(
+        "--extra-basename",
+        help="Optional basename for additional short-cycle artifacts.",
+    )
+    parser.add_argument(
+        "--extra-sequence-output",
+        type=Path,
+        help="Independent .seq output for all additional short-cycle routes.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -1855,28 +2702,64 @@ def main() -> None:
         raise CycleCoverError("--max-candidates must be positive.")
     if args.sequence_output is not None and args.sequence_repeat_count < 1:
         raise CycleCoverError("--sequence-repeat-count must be positive.")
-    result = analyze_cycle_cover(
-        dot_path=args.dot,
-        closure_dot_path=args.closure_dot,
-        excluded_states=args.exclude_state,
-        required_inputs=args.required_input,
-        required_outputs=args.required_output,
-        signal_mode=args.signal_mode,
-        max_candidates=args.max_candidates,
-        allow_closed_walk_fallback=not args.no_closed_walk_fallback,
-    )
-    summary = generate_outputs(
-        result,
-        output_dir=args.output_dir,
-        basename=args.basename or args.dot.stem,
-        formats=parse_formats(args.formats),
-        engine=args.engine,
-        overwrite=args.overwrite,
-        sequence_output=args.sequence_output,
-        sequence_start_state=args.sequence_start_state,
-        sequence_repeat_count=args.sequence_repeat_count,
-        sequence_merged_input_policy=args.sequence_merged_input_policy,
-    )
+    parse_formats(args.formats)
+    if args.sequence_output is not None or args.extra_output_dir is not None or args.extra_sequence_output is not None:
+        if args.sequence_output is None:
+            raise CycleCoverError("Layered route generation requires --sequence-output for the base group.")
+        if args.no_closed_walk_fallback:
+            raise CycleCoverError("Layered route generation always uses the strict residual fallback stage.")
+        analysis = build_layered_analysis(
+            dot_path=args.dot,
+            closure_dot_path=args.closure_dot,
+            excluded_states=args.exclude_state,
+            required_inputs=args.required_input,
+            required_outputs=args.required_output,
+            signal_mode=args.signal_mode,
+            max_candidates=args.max_candidates,
+        )
+        for warning in analysis.input_warnings:
+            print(
+                "WARNING " + warning["code"] + ": " + warning["message"] + " "
+                + " -> ".join(warning["pair"]),
+                file=sys.stderr,
+            )
+        summary = generate_layered_outputs(
+            analysis=analysis,
+            output_dir=args.output_dir,
+            basename=args.basename or args.dot.stem,
+            sequence_output=args.sequence_output,
+            start_state=args.sequence_start_state,
+            repeat_count=args.sequence_repeat_count,
+            merged_input_policy=args.sequence_merged_input_policy,
+            engine=args.engine,
+            overwrite=args.overwrite,
+            extra_output_dir=args.extra_output_dir,
+            extra_basename=args.extra_basename,
+            extra_sequence_output=args.extra_sequence_output,
+        )
+    else:
+        result = analyze_cycle_cover(
+            dot_path=args.dot,
+            closure_dot_path=args.closure_dot,
+            excluded_states=args.exclude_state,
+            required_inputs=args.required_input,
+            required_outputs=args.required_output,
+            signal_mode=args.signal_mode,
+            max_candidates=args.max_candidates,
+            allow_closed_walk_fallback=not args.no_closed_walk_fallback,
+        )
+        summary = generate_outputs(
+            result,
+            output_dir=args.output_dir,
+            basename=args.basename or args.dot.stem,
+            formats={"svg"},
+            engine=args.engine,
+            overwrite=args.overwrite,
+            sequence_output=args.sequence_output,
+            sequence_start_state=args.sequence_start_state,
+            sequence_repeat_count=args.sequence_repeat_count,
+            sequence_merged_input_policy=args.sequence_merged_input_policy,
+        )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

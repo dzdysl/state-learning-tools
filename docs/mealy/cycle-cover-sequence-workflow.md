@@ -11,25 +11,36 @@ into directly executable `multiSeq` input sequences.
    successful render: a file whose line breaks were escaped as literal `\\n`
    is malformed XML and Inkscape cannot open it. Render to a temporary path and
    publish it only after this check passes.
-2. Run the exact signal-constrained cycle-cover analysis. The SMP edges are
-   coverage targets; the original DOT supplies closure transitions.
-3. For every selected closed route, choose the numerically smallest `sN`
+2. With `--sequence-output`, run the layered signal-constrained route analysis.
+   The SMP edges are concrete coverage targets; the original DOT supplies
+   closure transitions. Parallel SMP state-pair edges are retained as separate
+   targets and reported as an input warning instead of aborting the analysis.
+   The base group first selects simple cycles for every simple-coverable target,
+   then uses composite closed walks only for the residual targets. Concrete KSI
+   self-loops are appended to the base group as standalone tests.
+3. When `--extra-output-dir` and `--extra-sequence-output` are supplied, write
+   a separate additional group containing every signal-valid length-3/4/5
+   simple route that contains an SMP target edge, plus one variant for every
+   eligible concrete self-loop on that route. A standalone self-loop repeats
+   10 times; an embedded self-loop executes 3 times in each iteration of its
+   enclosing route.
+4. For every selected closed route, choose the numerically smallest `sN`
    state. If that state occurs more than once in a composite closed walk, use
    its first occurrence in the canonical selected route and rotate the route
    there.
-4. On the filtered original DOT, compute one shortest access sequence from
+5. On the filtered original DOT, compute one shortest access sequence from
    `s0` to that state. Breadth-first search minimizes the number of inputs;
    equal-length paths use the original DOT transition appearance order.
-5. Materialize merged SMP inputs according to the requested policy. `first`
+6. Materialize merged SMP inputs according to the requested policy. `first`
    selects the first DOT input on every merged edge. `expand` emits the
    Cartesian product of all edge inputs.
-6. For each concrete route variant, append the same complete route the
+7. For each concrete route variant, append the same complete route the
    requested number of times. Do not choose a different merged input in each
    repetition.
-7. Simulate every generated line against the filtered original DOT. Require
+8. Simulate every generated line against the filtered original DOT. Require
    every transition to exist and every repeated route to finish at its chosen
    start state.
-8. Store the final `.seq` under the experiment record's `inputs/` directory.
+9. Store the final `.seq` under the experiment record's `inputs/` directory.
    Record the command, source hashes, line count, expansion policy, repetition
    count and output SHA-256 in the experiment record.
 
@@ -56,11 +67,16 @@ newline.
   --sequence-start-state s0 `
   --sequence-repeat-count 10 `
   --sequence-merged-input-policy expand `
+  --extra-output-dir <record>\analysis\derived\cycle_cover\extra `
+  --extra-basename hypothesis_N_extra `
+  --extra-sequence-output <record>\inputs\hypothesis_N_extra_cycle_cover_repeat10.seq `
   --overwrite
 ```
 
 Omit `--sequence-output` when only the cover and per-route SVGs are required.
 The other sequence options have no effect unless sequence output is enabled.
+Supply both extra output options to enable the additional group; its JSON,
+report, SVG directory and `.seq` are independent from the base group.
 
 ## Manual repeated-cycle trace analysis
 

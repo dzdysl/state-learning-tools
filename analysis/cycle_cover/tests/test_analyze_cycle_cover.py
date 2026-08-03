@@ -30,6 +30,14 @@ H13_RECORD = (
 H13_TARGET = H13_RECORD / "analysis" / "derived" / "hypothesis_13_smp.dot"
 H13_CLOSURE = H13_RECORD / "evidence" / "hypotheses" / "hypothesis_13.dot"
 H13_AVAILABLE = H13_TARGET.is_file() and H13_CLOSURE.is_file()
+H14_RECORD = (
+    H13_RECORD
+    / "followups"
+    / "h14-learning-complete-finalizer-failed-20260801"
+)
+H14_TARGET = H14_RECORD / "analysis" / "derived" / "hypothesis_14_smp.dot"
+H14_CLOSURE = H14_RECORD / "evidence" / "hypotheses" / "hypothesis_14.dot"
+H14_AVAILABLE = H14_TARGET.is_file() and H14_CLOSURE.is_file()
 
 
 def write_dot(directory: Path, name: str, body: str) -> Path:
@@ -787,6 +795,172 @@ class H13IntegrationTests(unittest.TestCase):
             metadata["validation"]["excluded_states_absent_from_access_graph"]
         )
         self.assertTrue(all(line and "  " not in line for line in lines))
+
+
+class LayeredRouteTests(unittest.TestCase):
+    def test_parallel_targets_and_concrete_self_loops_are_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = write_dot(
+                root,
+                "target.dot",
+                """
+  s0 -> s1 [label="a / authenticationRequest"];
+  s0 -> s1 [label="b / authenticationRequest"];
+""",
+            )
+            closure = write_dot(
+                root,
+                "closure.dot",
+                """
+  s0 -> s1 [label="a / authenticationRequest"];
+  s0 -> s1 [label="b / authenticationRequest"];
+  s1 -> s0 [label="return / null_action"];
+  s1 -> s1 [label="registrationRequest / authenticationRequest"];
+  s1 -> s1 [label="registrationRequestGUTI / authenticationRequest"];
+""",
+            )
+            analysis = cycle_cover.build_layered_analysis(
+                target,
+                closure,
+                excluded_states=[],
+                required_inputs=[],
+                required_outputs=["authenticationRequest"],
+            )
+            self.assertEqual(2, len(analysis.targets))
+            self.assertEqual("parallel_target_state_pair", analysis.input_warnings[0]["code"])
+            covered = set().union(
+                *(route.target_ids for route in analysis.base_simple_routes)
+            )
+            self.assertEqual({"E001", "E002"}, covered)
+            self.assertEqual(2, len(analysis.standalone_self_loops))
+            self.assertEqual(
+                ["registrationRequest / authenticationRequest", "registrationRequestGUTI / authenticationRequest"],
+                [route.edges[0].label for route in analysis.standalone_self_loops],
+            )
+
+    def test_embedded_self_loop_runs_three_times_in_every_repeat(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = write_dot(
+                root,
+                "target.dot",
+                """
+  s0 -> s1 [label="a / authenticationRequest"];
+  s1 -> s2 [label="b / null_action"];
+  s2 -> s0 [label="c / null_action"];
+""",
+            )
+            closure = write_dot(
+                root,
+                "closure.dot",
+                """
+  s0 -> s1 [label="a / authenticationRequest"];
+  s1 -> s2 [label="b / null_action"];
+  s2 -> s0 [label="c / null_action"];
+  s1 -> s1 [label="loop / authenticationRequest"];
+""",
+            )
+            analysis = cycle_cover.build_layered_analysis(
+                target, closure, [], [], ["authenticationRequest"]
+            )
+            self.assertEqual(1, len(analysis.extra_short_routes))
+            self.assertEqual(1, len(analysis.extra_embedded_routes))
+            lines, metadata = cycle_cover.build_route_sequence_export(
+                analysis,
+                analysis.extra_embedded_routes,
+                start_state="s0",
+                repeat_count=2,
+                merged_input_policy="expand",
+            )
+            self.assertEqual(["a loop loop loop b c a loop loop loop b c"], lines)
+            self.assertEqual(1, metadata["line_count"])
+
+    def test_base_and_extra_outputs_are_isolated_and_valid_svg(self) -> None:
+        try:
+            cycle_cover.resolve_graphviz_engine("dot")
+        except cycle_cover.CycleCoverError as error:
+            self.skipTest(str(error))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = write_dot(
+                root,
+                "target.dot",
+                """
+  s0 -> s1 [label="a / authenticationRequest"];
+  s1 -> s2 [label="b / null_action"];
+  s2 -> s0 [label="c / null_action"];
+""",
+            )
+            closure = write_dot(
+                root,
+                "closure.dot",
+                """
+  s0 -> s1 [label="a / authenticationRequest"];
+  s1 -> s2 [label="b / null_action"];
+  s2 -> s0 [label="c / null_action"];
+  s1 -> s1 [label="loop / authenticationRequest"];
+""",
+            )
+            analysis = cycle_cover.build_layered_analysis(
+                target, closure, [], [], ["authenticationRequest"]
+            )
+            summary = cycle_cover.generate_layered_outputs(
+                analysis,
+                root / "base",
+                "base",
+                root / "base.seq",
+                "s0",
+                2,
+                "expand",
+                "dot",
+                False,
+                root / "extra",
+                "extra",
+                root / "extra.seq",
+            )
+            self.assertIn("base", summary)
+            self.assertIn("extra", summary)
+            self.assertTrue((root / "base.seq").is_file())
+            self.assertTrue((root / "extra.seq").is_file())
+            self.assertTrue((root / "base" / "base_cycle_cover.json").is_file())
+            self.assertTrue((root / "extra" / "extra_cycle_cover.json").is_file())
+            for svg in list((root / "base" / "cycles").glob("*.svg")) + list((root / "extra" / "cycles").glob("*.svg")):
+                self.assertTrue(ET.parse(svg).getroot().tag.endswith("svg"))
+
+
+@unittest.skipUnless(H14_AVAILABLE, "H14 experiment evidence is not available")
+class H14LayeredIntegrationTests(unittest.TestCase):
+    def test_h14_layered_baseline_and_sequences(self) -> None:
+        analysis = cycle_cover.build_layered_analysis(
+            H14_TARGET,
+            H14_CLOSURE,
+            excluded_states=["s2"],
+            required_inputs=[],
+            required_outputs=["authenticationRequest", "securityModeCommand"],
+            signal_mode="output-only",
+        )
+        self.assertEqual(36, len(analysis.targets))
+        self.assertEqual(6, len(analysis.standalone_self_loops))
+        self.assertEqual(16, len(analysis.extra_short_routes))
+        self.assertEqual(30, len(analysis.extra_embedded_routes))
+        self.assertTrue(analysis.base_fallback_routes)
+        base = (
+            analysis.base_simple_routes
+            + analysis.base_fallback_routes
+            + analysis.standalone_self_loops
+        )
+        extra = analysis.extra_short_routes + analysis.extra_embedded_routes
+        base_lines, base_metadata = cycle_cover.build_route_sequence_export(
+            analysis, base, "s0", 10, "expand"
+        )
+        extra_lines, extra_metadata = cycle_cover.build_route_sequence_export(
+            analysis, extra, "s0", 10, "expand"
+        )
+        self.assertEqual(37, len(base_lines))
+        self.assertEqual(70, len(extra_lines))
+        self.assertTrue(base_metadata["validation"]["all_lines_simulated_against_closure_dot"])
+        self.assertTrue(extra_metadata["validation"]["all_lines_close_after_each_iteration"])
 
 
 if __name__ == "__main__":
