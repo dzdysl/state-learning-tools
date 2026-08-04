@@ -80,8 +80,72 @@ report, SVG directory and `.seq` are independent from the base group.
 
 ## Manual repeated-cycle trace analysis
 
+### Authoritative trace input
+
+Use `statelearner_trace.jsonl` as the only authoritative trace for model
+comparison, executed-sequence coverage, repeated-cycle alignment, and register
+inference. Read every valid JSONL record and preserve the original file hash.
+
+Do **not** use `statelearner_trace.cleaned.jsonl` as an analysis input. It is a
+derived filtering view and may omit whole sequences or individual observations.
+It can be retained for audit or human browsing only. The runner console can
+confirm that logical sequences completed, but it cannot replace the complete
+trace for step-level output comparison.
+
+### Mandatory raw-data materialization
+
+Before any alignment or register inference, freeze one explicit raw run window.
+For a run larger than the record's Git boundary, first create and hash an
+external snapshot under `D:\state-learning-lab\run-data\<platform>\<run-id>`
+and record it in `artifacts.yaml`. Never point analysis at a live launcher
+directory, a wildcard collection, or an append-only root log.
+
+The only permitted conversion from the runner trace to an inference input is a
+**lossless materialization**:
+
+1. Take the raw `statelearner_trace.jsonl` from the frozen snapshot.
+2. Validate its UTF-8 JSONL records and the inference adapter's grouping
+   contract against the exact `.seq`, selected `sequence_export.cycles`, and
+   register-inference YAML.
+3. Copy its bytes unchanged to `evidence/statelearner_trace.jsonl` and require
+   equal byte size and SHA-256 before using it.
+4. Write a derived trace-materialization JSON manifest that records both paths,
+   hashes, record/group counts, selected-cycle-to-trace matches, and the fact
+   that payload transformation was `none`.
+
+Use the versioned preparation tool; the output path must be exactly the
+configuration's `inputs.trace` path, so the subsequent inference cannot point
+at a different file:
+
+```powershell
+D:\anaconda3\python.exe D:\state-learning-lab\projects\state-learning-tools\analysis\register_inference\experiments\prepare_register_inference_trace.py `
+  --config <record>\analysis\derived\register_inference\<name>-inference.yaml `
+  --source-trace D:\state-learning-lab\run-data\<platform>\<run-id>\statelearner_trace.jsonl `
+  --evidence-trace <record>\evidence\statelearner_trace.jsonl `
+  --manifest <record>\analysis\derived\register_inference\<name>-trace-materialization.json
+```
+
+This preparation tool intentionally rejects the legacy
+`sequence_export.routes` interface. It requires `sequence_export.cycles`, each
+selected variant's `line_number`, exactly one `sequence_id` group whose final
+`sequence_inputs` equals that `.seq` line, equal record/input counts, and a
+step-by-step match between `abstract_io.input` and the expected logical input.
+Sparse numeric `sequence_id` values are allowed; uniqueness of the matched
+group is required.
+
+No CSV export, `cleaned` trace, log grep, packet re-decode, field backfill,
+deduplication, sorting, null-field deletion, or cross-session concatenation is
+an inference input. The adapter may only perform three in-memory conversions:
+add the physical JSONL line number, parse a **configured** numeric field as an
+integer, and parse a **configured** signal field as a Boolean. It must never
+write those converted values back into evidence. If the complete raw trace
+lacks a required field or fails the grouping contract, record the run as
+unsuitable for that inference configuration rather than repairing the data.
+
 Analyze one `.seq` line at a time. Use the cycle-cover JSON to recover the
 line's concrete cycle, prefix length, loop length and concrete loop inputs.
+The JSON interface is `sequence_export.cycles`; use `cycle_id` and each
+variant's `loop_inputs`, never a legacy route key.
 Split the trace into prefix `l` and repetitions 1 through 10. Keep the prefix
 and repetition 1 as setup context, but fit repeated behavior only from
 repetitions 2 through 10.
@@ -130,3 +194,33 @@ the corresponding edge. Report:
 Do this exploration manually first. Do not add a fixed extraction or
 inference script until real trace results show that the edge boundaries,
 message names and field paths are stable.
+
+### Required inference record
+
+The register-inference configuration, materialization manifest, machine-readable
+candidate JSON, reader-facing Markdown summary and complete Excel audit workbook
+are one inseparable derived set. Schema v3 inference requires both `--report` and
+`--workbook`; a generic model-consistency report or a launcher log is not a
+substitute. The Markdown summary and workbook metadata must link the complete
+evidence trace, exact `.seq`, original DOT, cycle-cover JSON, configuration and
+result JSON by SHA-256. They must state the fitted repetitions, configured fields,
+unknown branches, alignment anomalies, candidate grade, and the distinction
+between `partition_divergent` and `confirmed_observational_conflict`.
+
+The required Markdown is the H13-style reader summary: one fixed-layout HTML
+table with every concrete DOT edge group and the four columns “cycle, edge and
+nodes / edge candidate / input register / candidate grade”. It preserves tied
+global candidates but refers detailed material to the workbook. The required
+Excel workbook contains separate filtered sheets for edge coordination, every
+`cycle_id` edge use, deterministic `V01…` variants and complete `loop_inputs`,
+candidate records, and reconciliation evidence. A repeated edge appears once in
+every cycle-use row. The workbook must keep all tied global, intersection,
+non-consensus and cycle-local candidates, expose candidate grade as its own
+column, and distinguish an empty intersection from a recorded
+`confirmed_observational_conflict`. Message pairs break after `/`; the Markdown
+uses HTML `colgroup` fixed widths, while the workbook freezes its header row,
+enables filters, wraps text and uses readable column widths.
+
+Workbook render previews belong in a system temporary directory and are inspected there. The
+artifact-tool `<workbook>.inspect.ndjson` sidecar is an intermediate verification file, not evidence
+or a deliverable: remove it after successful validation and never place it under an experiment record.

@@ -10,9 +10,14 @@ candidates; they are not claims about AMF implementation variables.
 from __future__ import annotations
 
 import argparse
+import html
 import hashlib
 import json
+import os
+import subprocess
 import sys
+import tempfile
+import zipfile
 from collections import defaultdict
 from itertools import product
 from pathlib import Path
@@ -301,7 +306,7 @@ def make_edge(
 
 def source_events(
     cycle: dict[str, Any], variant: dict[str, Any], records: list[dict[str, Any]], indexed_edges: dict[tuple[str, str, str], dict[str, Any]], end_repeat: int,
-) -> Iterable[tuple[int, dict[str, Any], dict[str, Any]]]:
+) -> Iterable[tuple[int, int, dict[str, Any], dict[str, Any]]]:
     prefix_length = cycle.get("prefix_length")
     loop_length = cycle.get("loop_length")
     loop_inputs = variant.get("loop_inputs")
@@ -313,7 +318,7 @@ def source_events(
         for edge_offset in range(loop_length):
             index = prefix_length + (repetition - 1) * loop_length + edge_offset
             record = records[index]
-            yield repetition, record, make_edge(cycle, loop_inputs, edge_offset, record, indexed_edges)
+            yield repetition, edge_offset + 1, record, make_edge(cycle, loop_inputs, edge_offset, record, indexed_edges)
 
 
 def output_observation(record: dict[str, Any], edge: dict[str, Any], downlink_paths: dict[str, str]) -> dict[str, Any] | None:
@@ -431,7 +436,7 @@ def build_regions(
     previous: dict[str, Any] | None = None
     pending_items: list[dict[str, Any]] = []
     regions: list[dict[str, Any]] = []
-    for repetition, record, edge in source_events(cycle, variant, records, indexed_edges, end_repeat):
+    for repetition, _, record, edge in source_events(cycle, variant, records, indexed_edges, end_repeat):
         # Event order is inherited from source_events.  Within an event,
         # configured signals precede numeric inputs, each in declaration order.
         pending_items.extend(signal_observations(record, edge, signal_definitions))
@@ -1057,7 +1062,7 @@ def build_v3_regions(
     previous: dict[str, Any] | None = None
     pending: list[dict[str, Any]] = []
     regions: list[dict[str, Any]] = []
-    for repetition, record, edge in source_events(cycle, variant, records, indexed_edges, end_repeat):
+    for repetition, loop_edge_index, record, edge in source_events(cycle, variant, records, indexed_edges, end_repeat):
         if repetition == initial_repeat:
             register_values = {}
         signals = signal_observations(record, edge, signal_definitions)
@@ -1067,7 +1072,7 @@ def build_v3_regions(
             cycle_register_ids.add(item["input_register_id"])
         event = {
             "cycle_id": cycle["cycle_id"], "sequence_line": variant["line_number"], "trace_sequence_id": sequence_id,
-            "repetition": repetition, "edge": edge, "trace_line": record["_trace_line"],
+            "repetition": repetition, "loop_edge_index": loop_edge_index, "edge": edge, "trace_line": record["_trace_line"],
             "event_position": record.get("step_id"), "signals": signals, "numeric_inputs": numeric,
             "input_register_values": {key: dict(value) for key, value in register_values.items()},
         }
@@ -1442,7 +1447,7 @@ def infer(config: dict[str, Any], config_path: Path) -> dict[str, Any]:
                 signal_definitions, start_repeat, end_repeat,
             )
             all_regions.extend(regions)
-            for _, _, edge in source_events(cycle, variant, records, indexed_edges, end_repeat):
+            for _, _, _, edge in source_events(cycle, variant, records, indexed_edges, end_repeat):
                 all_edges[edge["edge_id"]] = edge
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for region in all_regions:
@@ -1524,21 +1529,865 @@ def infer(config: dict[str, Any], config_path: Path) -> dict[str, Any]:
     }
 
 
+def report_state_key(value: str) -> tuple[int, str]:
+    digits = "".join(character for character in value if character.isdigit())
+    return (int(digits) if digits else -1, value)
+
+
+def report_code(text: str) -> str:
+    return "<code>" + html.escape(text).replace("\n", "<br>") + "</code>"
+
+
+def compact_report_text(text: str) -> str:
+    """Use reader-facing aliases without changing the machine-readable JSON semantics."""
+    return (
+        text.replace("unknown/unobserved_signal_branch", "unknown")
+        .replace("unknown/unanchored_signal_context", "unknown")
+        .replace("unknown/insufficient_support", "unknown")
+        .replace("r_i[ngksi_uplink]", "r_i")
+    )
+
+
+def compact_report_code(text: str) -> str:
+    return report_code(compact_report_text(text))
+
+
+def report_candidate_grade_label(grade: str) -> str:
+    return {
+        "relatively_stable_candidate": "相对稳定",
+        "hypothetical_candidate": "假设性",
+    }.get(grade, grade)
+
+
+def report_reconciliation_label(status: str) -> str:
+    return {
+        "consistent": "全局一致",
+        "not_applicable_no_downlink_anchor": "无下行锚点",
+        "partition_divergent": "分区分歧",
+        "confirmed_observational_conflict": "直接观察冲突",
+        "不适用（单边区域）": "单边区域",
+    }.get(status, status)
+
+
+def report_observation_label(status: str) -> str:
+    return {
+        "observationally_exact_candidate": "完整观察",
+        "partial_observational_candidate": "部分观察",
+    }.get(status, status)
+
+
+def report_scope_label(scope: str) -> str:
+    return {
+        "global_candidate": "全局候选",
+        "intersection_candidate": "全局交集",
+        "non_consensus_candidate": "非共识候选",
+        "partition_candidate": "循环局部候选",
+    }.get(scope, scope)
+
+
+def report_route_kind_label(kind: str) -> str:
+    return {
+        "base_simple_cover": "简单覆盖",
+        "base_fallback": "补充闭合游走",
+        "base_standalone_self_loop": "独立自环",
+    }.get(kind, kind)
+
+def report_message_pair(edge: dict[str, Any]) -> str:
+    return report_code(str(edge["logical_input"])) + "/<br>" + report_code(str(edge["logical_output"]))
+
+
+def report_input_sequence(inputs: Iterable[Any]) -> str:
+    return " →<br>".join(report_code(str(item)) for item in inputs)
+
+
+def report_edge_identity(edge: dict[str, Any]) -> str:
+    return "<br>".join((
+        report_code(str(edge["edge_id"])),
+        report_code(f"{edge['source_state']} → {edge['target_state']}"),
+        report_message_pair(edge),
+    ))
+
+
+def report_candidate_list(candidates: list[dict[str, Any]], *, include_grade: bool = True) -> str:
+    if not candidates:
+        return "无"
+    rendered: list[str] = []
+    for candidate in candidates:
+        prefix: list[str] = []
+        if include_grade and candidate.get("candidate_grade"):
+            prefix.append(report_candidate_grade_label(str(candidate["candidate_grade"])))
+        text = compact_report_code(str(candidate.get("update_tree_text", "<missing update_tree_text>")))
+        rendered.append(("；".join(prefix) + "：" if prefix else "") + text)
+    return "<br><br>".join(rendered)
+
+
+def report_input_updates(updates: list[dict[str, Any]]) -> str:
+    if not updates:
+        return "无"
+    rendered: list[str] = []
+    seen: set[str] = set()
+    for item in updates:
+        text = compact_report_text(str(item.get("update", {}).get("text", "<missing update>")))
+        if text not in seen:
+            seen.add(text)
+            rendered.append(compact_report_code(text))
+    return "<br>".join(rendered)
+
+
+def report_all_input_updates(samples: list[dict[str, Any]]) -> str:
+    return report_input_updates([
+        update
+        for sample in samples
+        for update in sample.get("input_register_updates", [])
+    ])
+
+
+def report_reconciliation(result: dict[str, Any]) -> tuple[str, str, str, str]:
+    reconciliation = result.get("hypothetical_reconciliation") or {}
+    status = reconciliation.get("reconciliation_status")
+    if status is None:
+        status_text = "不适用（单边区域）"
+    else:
+        status_text = html.escape(str(status))
+    intersection = reconciliation.get("intersection_candidates", [])
+    if intersection:
+        intersection_text = report_candidate_list(intersection, include_grade=False)
+        intersection_state = "非空"
+    elif status == "not_applicable_no_downlink_anchor":
+        intersection_text = "不适用（无下行锚点）"
+        intersection_state = "不适用"
+    else:
+        intersection_text = "空"
+        intersection_state = "空"
+    non_consensus = reconciliation.get("non_consensus_candidates", [])
+    non_consensus_text = report_candidate_list(non_consensus, include_grade=False)
+    if non_consensus:
+        non_consensus_text += "<br>" + "<br>".join(
+            "支持循环：" + html.escape("、".join(candidate.get("supporting_cycle_ids", [])))
+            + "；缺失循环：" + html.escape("、".join(candidate.get("missing_cycle_ids", [])))
+            for candidate in non_consensus
+        )
+    return status_text, intersection_state, intersection_text, non_consensus_text
+
+
+def report_conflicts(conflicts: list[dict[str, Any]]) -> str:
+    if not conflicts:
+        return "无"
+    rendered: list[str] = []
+    for conflict in conflicts:
+        observation = conflict.get("observation", {})
+        values = ", ".join(str(value) for value in conflict.get("r_after_values", []))
+        signals = observation.get("signals", [])
+        numeric = observation.get("numeric_inputs", [])
+        registers = observation.get("input_register_values", [])
+        observation_lines = [report_code(f"r_before={observation.get('r_before')}")]
+        observation_lines.extend(
+            report_code(f"{item.get('signal_id', item.get('field_path'))}={item.get('value')}")
+            for item in signals
+        )
+        observation_lines.extend(
+            report_code(f"{item.get('input_register_id', item.get('field_path'))}={item.get('value')}")
+            for item in numeric
+        )
+        observation_lines.extend(
+            report_code(f"r_i[{item.get('input_register_id')}]={item.get('value')}")
+            for item in registers
+        )
+        evidence = conflict.get("evidence", [])
+        evidence_text = "；<br>".join(
+            html.escape(f"{item['cycle_id']} R{item['repetition']}（r_after={item['r_after']}）")
+            for item in evidence
+        )
+        rendered.append(
+            "相同观察键：" + "<br>".join(observation_lines)
+            + "<br>" + report_code("r_after ∈ {" + values + "}")
+            + "<br>" + evidence_text
+        )
+    return "<br><br>".join(rendered)
+
+
+def report_table(headers: list[str], widths: list[str], rows: list[list[str]], *, table_id: str) -> str:
+    header_html = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
+    def table_cell(cell: str) -> str:
+        return cell.replace("<br>", "<br>\n        ")
+
+    body = "\n".join(
+        "    <tr>\n" + "\n".join(f"      <td>{table_cell(cell)}</td>" for cell in row) + "\n    </tr>"
+        for row in rows
+    )
+    columns = "".join(f"    <col style=\"width:{width}\">\n" for width in widths)
+    return "\n".join((
+        f"<table id=\"{html.escape(table_id)}\" style=\"width:100%; table-layout:fixed\">",
+        "  <colgroup>", columns.rstrip(), "  </colgroup>",
+        f"  <thead><tr>{header_html}</tr></thead>",
+        "  <tbody>", body, "  </tbody>", "</table>",
+    ))
+
+
+def report_cycle_catalog(
+    cycles: list[dict[str, Any]],
+    usage_by_cycle: dict[str, dict[str, dict[str, set[Any]]]],
+) -> tuple[str, dict[tuple[str, int], str]]:
+    variant_ids: dict[tuple[str, int], str] = {}
+    rows: list[list[str]] = []
+    for cycle in cycles:
+        cycle_id = str(cycle["cycle_id"])
+        variants = cycle["variants"]
+        rendered_variants: list[str] = []
+        for ordinal, variant in enumerate(variants, start=1):
+            variant_id = f"V{ordinal:02d}"
+            line_number = variant["line_number"]
+            variant_ids[(cycle_id, line_number)] = variant_id
+            edges = sorted(
+                {
+                    edge_id for edge_id, item in usage_by_cycle.get(cycle_id, {}).items()
+                    if line_number in item["sequence_lines"]
+                },
+                key=report_state_key,
+            )
+            rendered_variants.append(
+                report_code(variant_id) + "：<br>" + report_input_sequence(variant["loop_inputs"])
+                + "<br>具体边：" + html.escape("、".join(edges) or "无")
+            )
+        rows.append([
+            report_code(cycle_id), html.escape(str(cycle.get("cycle_kind", cycle.get("route_kind", "unknown")))),
+            "完整闭环 × " + html.escape(str(cycle.get("repeat_count", "?"))),
+            "<br><br>".join(rendered_variants),
+        ])
+    return report_table(
+        ["循环", "类型", "重复结构", "expand 变体（不含 .seq 行号）"],
+        ["12%", "18%", "16%", "54%"], rows, table_id="cycle-catalog",
+    ), variant_ids
+
+
+def report_cycle_usage_index(
+    results: list[dict[str, Any]],
+    variant_ids: dict[tuple[str, int], str],
+) -> dict[str, dict[str, dict[str, set[Any]]]]:
+    usage: dict[str, dict[str, dict[str, set[Any]]]] = defaultdict(
+        lambda: defaultdict(lambda: {"variants": set(), "sequence_lines": set(), "loop_edge_indexes": set()})
+    )
+    for result in results:
+        edge_id = str(result["edge"]["edge_id"])
+        for sample in result["edge_samples"]:
+            cycle_id = str(sample["cycle_id"])
+            line_number = sample["sequence_line"]
+            key = (cycle_id, line_number)
+            if key not in variant_ids:
+                raise RegionInferenceError(f"Report coverage: {cycle_id} has an unknown selected variant.")
+            item = usage[cycle_id][edge_id]
+            item["variants"].add(variant_ids[key])
+            item["sequence_lines"].add(line_number)
+            item["loop_edge_indexes"].add(sample.get("loop_edge_index"))
+    return usage
+
+
+def report_partition_for_cycle(result: dict[str, Any], cycle_id: str) -> list[dict[str, Any]]:
+    reconciliation = result.get("hypothetical_reconciliation") or {}
+    for partition in reconciliation.get("partitions", []):
+        if partition.get("cycle_id") == cycle_id:
+            return partition.get("candidates", [])
+    return []
+
+
+def report_file_link(path: Path, report_path: Path | None) -> str:
+    del report_path
+    return report_code(path.name)
+
+
+def report_candidate_grades(candidates: list[dict[str, Any]]) -> str:
+    grades = sorted({str(candidate["candidate_grade"]) for candidate in candidates if candidate.get("candidate_grade")})
+    return "<br>".join(report_candidate_grade_label(grade) for grade in grades) if grades else "—"
+
+
+def text_candidate_list(candidates: list[dict[str, Any]]) -> str:
+    if not candidates:
+        return "无"
+    return "\n\n".join(
+        compact_report_text(str(candidate.get("update_tree_text", "<missing update_tree_text>")))
+        for candidate in candidates
+    )
+
+
+def text_input_updates(updates: list[dict[str, Any]]) -> str:
+    if not updates:
+        return "无"
+    rendered: list[str] = []
+    seen: set[str] = set()
+    for item in updates:
+        text = compact_report_text(str(item.get("update", {}).get("text", "<missing update>")))
+        if text not in seen:
+            seen.add(text)
+            rendered.append(text)
+    return "\n".join(rendered)
+
+
+def text_all_input_updates(samples: list[dict[str, Any]]) -> str:
+    return text_input_updates([
+        update
+        for sample in samples
+        for update in sample.get("input_register_updates", [])
+    ])
+
+
+def candidate_grade(candidate: dict[str, Any], item: dict[str, Any], scope: str) -> str:
+    grade = candidate.get("candidate_grade")
+    if grade:
+        return str(grade)
+    if scope in {"intersection_candidate", "non_consensus_candidate", "partition_candidate"}:
+        return "hypothetical_candidate"
+    matching = {
+        str(existing.get("candidate_grade"))
+        for existing in item.get("candidates", [])
+        if existing.get("update_tree_text") == candidate.get("update_tree_text") and existing.get("candidate_grade")
+    }
+    return "\n".join(sorted(matching)) if matching else "无候选类型"
+
+
+def candidate_complexity_text(candidate: dict[str, Any]) -> str:
+    complexity = candidate.get("complexity", {})
+    if not complexity:
+        return "无"
+    labels = {
+        "configured_signal_depth": "信号层",
+        "derived_value_nodes": "派生值节点",
+        "leaf_formula_complexity": "叶公式复杂度",
+        "threshold_nodes": "阈值节点",
+        "unknown_branches": "未知分支",
+    }
+    return "；".join(f"{labels.get(key, key)}={value}" for key, value in sorted(complexity.items()))
+
+
+def report_audit_context(
+    result: dict[str, Any], config: dict[str, Any], config_path: Path,
+) -> dict[str, Any]:
+    cycle_cover_path = resolve(config_path, config["inputs"]["cycle_cover"])
+    cycle_cover = json.loads(cycle_cover_path.read_text(encoding="utf-8"))
+    cycles = selected_cycles(cycle_cover, config["analysis"].get("cycle_ids"))
+    variant_ids = {
+        (str(cycle["cycle_id"]), variant["line_number"]): f"V{ordinal:02d}"
+        for cycle in cycles
+        for ordinal, variant in enumerate(cycle["variants"], start=1)
+    }
+    usage_by_cycle = report_cycle_usage_index(result["results"], variant_ids)
+    by_edge = {str(item["edge"]["edge_id"]): item for item in result["results"]}
+    integrity = {
+        "edge_group_count": len(by_edge),
+        "cycle_count": len(cycles),
+        "cycle_variant_count": len(variant_ids),
+        "cycle_edge_usage_count": sum(len(edges) for edges in usage_by_cycle.values()),
+    }
+    return {
+        "cycles": cycles,
+        "variant_ids": variant_ids,
+        "usage_by_cycle": usage_by_cycle,
+        "by_edge": by_edge,
+        "integrity": integrity,
+    }
+
+
+def render_v3_report(
+    result: dict[str, Any], config: dict[str, Any], config_path: Path,
+    report_path: Path | None = None, output_path: Path | None = None,
+    workbook_path: Path | None = None,
+) -> tuple[str, dict[str, int]]:
+    context = report_audit_context(result, config, config_path)
+    by_edge = context["by_edge"]
+    summary_rows: list[list[str]] = []
+    for edge_id in sorted(by_edge, key=report_state_key):
+        item = by_edge[edge_id]
+        status, intersection_state, intersection, non_consensus = report_reconciliation(item)
+        cycle_ids = sorted({sample["cycle_id"] for sample in item["edge_samples"]}, key=report_state_key)
+        reconciliation_summary = report_reconciliation_label(status) + "；交集：" + intersection_state
+        if status == "confirmed_observational_conflict":
+            reconciliation_summary += "；直接观察冲突详见 Excel"
+        elif status == "partition_divergent":
+            reconciliation_summary += "；局部候选与非共识详见 Excel"
+        elif non_consensus != "无":
+            reconciliation_summary += "；非共识详见 Excel"
+        summary_rows.append([
+            "<br>".join(report_code(cycle_id) for cycle_id in cycle_ids) + " " + report_edge_identity(item["edge"]),
+            report_candidate_list(item["candidates"], include_grade=False),
+            report_all_input_updates(item["edge_samples"]),
+            report_candidate_grades(item["candidates"]) + "<br>" + reconciliation_summary,
+        ])
+
+    input_lines = [
+        "- " + report_file_link(Path(item["path"]), report_path) + "："
+        + report_code(item["sha256"])
+        for _, item in sorted(result["inputs"].items())
+    ]
+    input_lines.append(
+        "- " + report_file_link(config_path, report_path) + "：" + report_code(sha256_file(config_path))
+    )
+    if output_path is not None:
+        input_lines.append("- " + report_file_link(output_path, report_path) + "：同次命令生成的机器可读候选 JSON")
+    lines = [
+        "# ngKSI 边级寄存器候选推断摘要", "",
+        "## 范围与读取规则", "",
+        "本报告由 schema v3 推断器直接生成。循环以 `cycle_id` 为主键；变体 `Vxx` 只描述",
+        "`expand` 产生的逻辑输入差异，不把物理 `.seq` 行号作为报告主键。每个具体 DOT 边均按",
+        "`src → dst` 与 `input / output` 列出；同一边在不同循环中的使用不会合并删除。", "",
+        "候选是可被后续行为反驳的观察候选，不是 AMF 源码变量或源码级更新时点。全局交集为空",
+        "不自动等于矛盾：只有“直接观察冲突”才表示相同完整观察键得到不同 `r_after`；",
+        "“分区分歧”仅表示局部公式不一致或无全局共识。", "",
+        "## 输入与参数", "",
+        "- 拟合轮次：`R%d–R%d`；输入寄存器初始化：`R%d`；拟合起点：`R%d`。" % (
+            result["parameters"]["repetitions"][0], result["parameters"]["repetitions"][1],
+            result["parameters"].get("input_register_initialization_repetition", result["parameters"]["repetitions"][0]),
+            result["parameters"].get("input_register_fitting_start", result["parameters"]["repetitions"][0]),
+        ),
+        *input_lines,
+        "- JSON、YAML、完整原始 trace 与环导出均由同次命令记录；不使用 cleaned trace。", "",
+        "## 重点结果", "",
+        "下表按 H13 固定四列格式整理全部具体 DOT 边组。全局候选保留并列公式；循环—边使用、",
+        "expand 变体、局部分区、非共识、空交集与直接冲突证据请阅读同次生成的 Excel 审计工作簿。", "",
+        report_table(
+            ["循环、边与节点", "边级候选", "输入寄存器", "候选等级"],
+            ["27%", "32%", "16%", "25%"], summary_rows, table_id="edge-summary",
+        ), "",
+        "## 详细审计工作簿", "",
+        "Excel 工作簿将边级协调、循环—边使用、变体、逐公式候选与协调证据分别置于可筛选工作表；",
+        "它以独立候选类型列区分相对稳定与假设性候选。",
+        ("- 工作簿：" + report_file_link(workbook_path, report_path)) if workbook_path is not None else "- 工作簿：由 `--workbook` 指定。",
+        "",
+    ]
+    integrity = context["integrity"]
+    lines.extend([
+        "## 完整性与可读性复核", "",
+        "- 边组数：%d；循环数：%d；变体数：%d；循环—边使用数：%d。" % (
+            integrity["edge_group_count"], integrity["cycle_count"], integrity["cycle_variant_count"], integrity["cycle_edge_usage_count"],
+        ),
+        "- 已断言：全部边组进入本摘要表；完整循环、变体、逐公式候选与协调证据进入 Excel 工作簿。",
+        "- 可读性：摘要表使用固定布局 HTML、`colgroup` 固定列宽；消息对在 `/` 后换行，状态边与",
+        "  公式独立换行。工作簿冻结表头、启用筛选和单元格换行，避免长字段或中文逐字竖排。",
+    ])
+    report = "\n".join(lines) + "\n"
+    validate_v3_report(report, result, integrity)
+    return report, integrity
+
+
+def validate_v3_report(
+    report: str,
+    result: dict[str, Any],
+    integrity: dict[str, int],
+) -> None:
+    searchable = report.replace("<br>\n        ", "<br>")
+    if report.count('style="width:100%; table-layout:fixed"') != 1 or "<colgroup>" not in report:
+        raise RegionInferenceError("Report validation: H13-style fixed-layout summary table is incomplete.")
+    if "/<br>" not in report:
+        raise RegionInferenceError("Report validation: logical message pairs are missing explicit line breaks.")
+    if integrity["edge_group_count"] != len(result["results"]):
+        raise RegionInferenceError("Report validation: not every edge group is represented.")
+    for item in result["results"]:
+        edge_id = str(item["edge"]["edge_id"])
+        if searchable.count(report_code(edge_id)) < 1:
+            raise RegionInferenceError(f"Report validation: missing summary edge {edge_id}.")
+        for candidate in item["candidates"]:
+            if compact_report_code(str(candidate["update_tree_text"])) not in searchable:
+                raise RegionInferenceError(f"Report validation: global candidate lost for {edge_id}.")
+
+
+WORKBOOK_SHEET_NAMES = ("概览", "边级协调", "循环-边使用", "变体", "候选明细", "协调证据")
+
+
+def workbook_sheet(name: str, headers: list[str], rows: list[list[str]], widths: list[int], candidate_type_column: int | None = None) -> dict[str, Any]:
+    if len(headers) != len(widths):
+        raise RegionInferenceError(f"Workbook payload: {name} header/width mismatch.")
+    if any(len(row) != len(headers) for row in rows):
+        raise RegionInferenceError(f"Workbook payload: {name} row width mismatch.")
+    return {
+        "name": name,
+        "headers": headers,
+        "rows": rows,
+        "widths": widths,
+        "candidateTypeColumn": candidate_type_column,
+    }
+
+
+def build_v3_workbook_payload(
+    result: dict[str, Any], config: dict[str, Any], config_path: Path,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    context = report_audit_context(result, config, config_path)
+    by_edge: dict[str, dict[str, Any]] = context["by_edge"]
+    cycles: list[dict[str, Any]] = context["cycles"]
+    usage_by_cycle: dict[str, dict[str, dict[str, set[Any]]]] = context["usage_by_cycle"]
+    variant_ids: dict[tuple[str, int], str] = context["variant_ids"]
+
+    overview_rows = [
+        ["边组数", str(context["integrity"]["edge_group_count"])],
+        ["循环数", str(context["integrity"]["cycle_count"])],
+        ["expand 变体数", str(context["integrity"]["cycle_variant_count"])],
+        ["循环—边使用数", str(context["integrity"]["cycle_edge_usage_count"])],
+        ["候选类型：相对稳定", "单边闭合区域的精确候选；不表示未观察分支。"],
+        ["候选类型：假设性", "多边区域拆分所得候选；局部候选与全局交集分开阅读。"],
+        ["协调状态：直接观察冲突", "相同完整观察键有不同 r_after。"],
+        ["协调状态：分区分歧", "局部公式不一致或交集为空，但不是直接观察冲突。"],
+        ["原始证据", "完整 statelearner_trace.jsonl；不使用 cleaned 派生视图。"],
+    ]
+
+    edge_rows: list[list[str]] = []
+    cycle_usage_rows: list[list[str]] = []
+    candidate_rows: list[list[str]] = []
+    evidence_rows: list[list[str]] = []
+    for edge_id in sorted(by_edge, key=report_state_key):
+        item = by_edge[edge_id]
+        edge = item["edge"]
+        reconciliation = item.get("hypothetical_reconciliation") or {}
+        status, intersection_state, intersection, _ = report_reconciliation(item)
+        cycles_for_edge = sorted({str(sample["cycle_id"]) for sample in item["edge_samples"]}, key=report_state_key)
+        edge_rows.append([
+            edge_id,
+            str(edge["source_state"]),
+            str(edge["target_state"]),
+            str(edge["logical_input"]),
+            str(edge["logical_output"]),
+            "\n".join(cycles_for_edge),
+            text_candidate_list(item["candidates"]),
+            text_all_input_updates(item["edge_samples"]),
+            "\n".join(sorted({str(candidate.get("candidate_grade")) for candidate in item["candidates"] if candidate.get("candidate_grade")})) or "无候选类型",
+            "\n".join(sorted({report_observation_label(str(candidate.get("observational_status"))) for candidate in item["candidates"] if candidate.get("observational_status")})) or "无",
+            text_candidate_list(reconciliation.get("intersection_candidates", [])) if intersection_state == "非空" else intersection_state,
+            "是" if intersection_state == "空" else "否",
+            report_reconciliation_label(status),
+            "协调证据" if reconciliation.get("partitions") or reconciliation.get("observational_conflicts") else "无",
+        ])
+
+        def add_candidates(scope: str, candidates: list[dict[str, Any]], cycle_scope: str) -> None:
+            for candidate in candidates:
+                candidate_rows.append([
+                    edge_id,
+                    report_scope_label(scope),
+                    cycle_scope,
+                    candidate_grade(candidate, item, scope),
+                    report_observation_label(str(candidate.get("observational_status", "无"))),
+                    compact_report_text(str(candidate.get("update_tree_text", "<missing update_tree_text>"))),
+                    text_input_updates(candidate.get("input_register_updates", [])),
+                    str(candidate.get("support_count", "—")),
+                    str(candidate.get("longest_consecutive_support", "—")),
+                    candidate_complexity_text(candidate),
+                    "\n".join(candidate.get("supporting_cycle_ids", [])) or "—",
+                    "\n".join(candidate.get("missing_cycle_ids", [])) or "—",
+                ])
+
+        add_candidates("global_candidate", item["candidates"], "全部适用循环")
+        add_candidates("intersection_candidate", reconciliation.get("intersection_candidates", []), "跨分区交集")
+        add_candidates("non_consensus_candidate", reconciliation.get("non_consensus_candidates", []), "非共识")
+        for partition in reconciliation.get("partitions", []):
+            cycle_id = str(partition.get("cycle_id", "<missing cycle_id>"))
+            add_candidates("partition_candidate", partition.get("candidates", []), cycle_id)
+            evidence_rows.append([
+                edge_id,
+                "循环分区",
+                cycle_id,
+                report_reconciliation_label(status),
+                "交集为空" if not reconciliation.get("intersection_candidates", []) else "交集非空",
+                text_candidate_list(partition.get("candidates", [])),
+                "—",
+            ])
+        for candidate in reconciliation.get("non_consensus_candidates", []):
+            evidence_rows.append([
+                edge_id,
+                "非共识候选",
+                "\n".join(candidate.get("supporting_cycle_ids", [])) or "—",
+                report_reconciliation_label(status),
+                "跨全部分区没有精确交集",
+                compact_report_text(str(candidate.get("update_tree_text", "<missing update_tree_text>"))),
+                "缺失循环：" + ("、".join(candidate.get("missing_cycle_ids", [])) or "无"),
+            ])
+        for conflict in reconciliation.get("observational_conflicts", []):
+            observation = conflict.get("observation", {})
+            evidence_rows.append([
+                edge_id,
+                "直接观察冲突",
+                "\n".join(str(item.get("cycle_id")) for item in conflict.get("evidence", [])),
+                "直接观察冲突",
+                "相同完整类型化观察键得到多个 r_after",
+                json.dumps(observation, ensure_ascii=False, sort_keys=True),
+                "r_after ∈ {" + ", ".join(str(value) for value in conflict.get("r_after_values", [])) + "}\n"
+                + "\n".join(
+                    f"{item['cycle_id']} R{item['repetition']}：r_after={item['r_after']}"
+                    for item in conflict.get("evidence", [])
+                ),
+            ])
+
+    for cycle in sorted(cycles, key=lambda item: report_state_key(str(item["cycle_id"]))):
+        cycle_id = str(cycle["cycle_id"])
+        for edge_id in sorted(usage_by_cycle.get(cycle_id, {}), key=report_state_key):
+            item = by_edge[edge_id]
+            edge = item["edge"]
+            usage = usage_by_cycle[cycle_id][edge_id]
+            positions = sorted(index for index in usage["loop_edge_indexes"] if isinstance(index, int))
+            local = report_partition_for_cycle(item, cycle_id)
+            reconciliation = item.get("hypothetical_reconciliation") or {}
+            status, intersection_state, intersection, _ = report_reconciliation(item)
+            local_candidates = local or item["candidates"]
+            cycle_usage_rows.append([
+                cycle_id,
+                report_route_kind_label(str(cycle.get("cycle_kind", cycle.get("route_kind", "unknown")))),
+                "、".join(str(index) for index in positions) if positions else "—",
+                "\n".join(sorted(usage["variants"])),
+                edge_id,
+                str(edge["source_state"]),
+                str(edge["target_state"]),
+                str(edge["logical_input"]),
+                str(edge["logical_output"]),
+                text_candidate_list(local_candidates),
+                "\n".join(sorted({candidate_grade(candidate, item, "partition_candidate") for candidate in local_candidates})),
+                text_candidate_list(reconciliation.get("intersection_candidates", [])) if intersection_state == "非空" else intersection_state,
+                report_reconciliation_label(status),
+            ])
+
+    variant_rows: list[list[str]] = []
+    for cycle in sorted(cycles, key=lambda item: report_state_key(str(item["cycle_id"]))):
+        cycle_id = str(cycle["cycle_id"])
+        embedded = cycle.get("embedded_self_loop")
+        embedded_text = json.dumps(embedded, ensure_ascii=False, sort_keys=True) if embedded else "无"
+        for variant in cycle["variants"]:
+            variant_id = variant_ids[(cycle_id, variant["line_number"])]
+            variant_edges = sorted(
+                edge_id for edge_id, usage in usage_by_cycle.get(cycle_id, {}).items()
+                if variant_id in usage["variants"]
+            )
+            injection = variant.get("embedded_self_loop_input")
+            variant_rows.append([
+                cycle_id,
+                report_route_kind_label(str(cycle.get("cycle_kind", cycle.get("route_kind", "unknown")))),
+                variant_id,
+                "完整闭环 × " + str(cycle.get("repeat_count", "?")),
+                " → ".join(str(value) for value in variant["loop_inputs"]),
+                "\n".join(variant_edges) or "无",
+                embedded_text,
+                str(injection) if injection is not None else "无",
+            ])
+
+    sheets = [
+        workbook_sheet("概览", ["项目", "值"], overview_rows, [34, 92]),
+        workbook_sheet(
+            "边级协调",
+            ["EID", "src", "dst", "input", "output", "使用循环", "全局候选", "输入寄存器更新", "候选类型", "观测状态", "全局交集", "交集为空", "协调状态", "证据引用"],
+            edge_rows, [11, 9, 9, 24, 24, 16, 48, 28, 26, 28, 48, 12, 34, 16], 8,
+        ),
+        workbook_sheet(
+            "循环-边使用",
+            ["cycle_id", "路线类型", "环内序号", "适用变体", "EID", "src", "dst", "input", "output", "本循环候选", "候选类型", "全局交集", "协调状态"],
+            cycle_usage_rows, [12, 26, 12, 14, 11, 9, 9, 24, 24, 48, 26, 48, 34], 10,
+        ),
+        workbook_sheet(
+            "变体",
+            ["cycle_id", "路线类型", "变体", "重复结构", "完整 loop_inputs", "具体边", "嵌入自环", "自环输入"],
+            variant_rows, [12, 26, 10, 18, 54, 22, 48, 22], None,
+        ),
+        workbook_sheet(
+            "候选明细",
+            ["EID", "作用域", "循环范围", "候选类型", "观测状态", "公式树", "输入寄存器更新", "支持样本", "最长连续支持", "复杂度", "支持循环", "缺失循环"],
+            candidate_rows, [11, 28, 20, 26, 30, 60, 28, 12, 16, 38, 18, 18], 3,
+        ),
+        workbook_sheet(
+            "协调证据",
+            ["EID", "证据类型", "循环范围", "协调状态", "交集/原因", "局部候选或观察键", "补充证据"],
+            evidence_rows, [11, 20, 20, 34, 34, 64, 54], None,
+        ),
+    ]
+    payload = {"schema": "register-inference-workbook-v1", "sheets": sheets}
+    sheet_rows = {sheet["name"]: len(sheet["rows"]) for sheet in sheets}
+    validate_v3_workbook_payload(payload, context, result)
+    return payload, sheet_rows
+
+
+def validate_v3_workbook_payload(payload: dict[str, Any], context: dict[str, Any], result: dict[str, Any]) -> None:
+    sheets = {sheet["name"]: sheet for sheet in payload.get("sheets", [])}
+    if tuple(sheets) != WORKBOOK_SHEET_NAMES:
+        raise RegionInferenceError("Workbook validation: required sheets are missing or reordered.")
+    if len(sheets["边级协调"]["rows"]) != context["integrity"]["edge_group_count"]:
+        raise RegionInferenceError("Workbook validation: edge-coordination coverage drifted.")
+    if len(sheets["循环-边使用"]["rows"]) != context["integrity"]["cycle_edge_usage_count"]:
+        raise RegionInferenceError("Workbook validation: cycle-edge coverage drifted.")
+    if len(sheets["变体"]["rows"]) != context["integrity"]["cycle_variant_count"]:
+        raise RegionInferenceError("Workbook validation: variant coverage drifted.")
+    if "候选类型" not in sheets["边级协调"]["headers"] or "候选类型" not in sheets["候选明细"]["headers"]:
+        raise RegionInferenceError("Workbook validation: candidate grade needs a dedicated column.")
+    edge_ids = {row[0] for row in sheets["边级协调"]["rows"]}
+    expected_edge_ids = {str(item["edge"]["edge_id"]) for item in result["results"]}
+    if edge_ids != expected_edge_ids:
+        raise RegionInferenceError("Workbook validation: one or more edge groups are missing.")
+    if not any(row[0] == "E0073" and row[1] == "直接观察冲突" for row in sheets["协调证据"]["rows"]):
+        raise RegionInferenceError("Workbook validation: E0073 direct-conflict evidence is missing.")
+
+
+def render_v3_workbook(
+    payload: dict[str, Any], workbook: Path, *, node: str, node_modules: str, preview_dir: Path | None = None,
+) -> dict[str, Any]:
+    renderer = Path(__file__).with_name("render_register_inference_workbook.mjs")
+    if not renderer.exists():
+        raise RegionInferenceError(f"Workbook renderer is missing: {renderer}")
+    if not node_modules:
+        raise RegionInferenceError(
+            "Workbook rendering requires artifact-tool node_modules. Set --workbook-node-modules or REGISTER_INFERENCE_NODE_MODULES."
+        )
+    with tempfile.TemporaryDirectory(prefix="register-inference-workbook-") as temporary:
+        payload_path = Path(temporary) / "workbook-payload.json"
+        payload_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        command = [node, str(renderer), "--payload", str(payload_path), "--output", str(workbook), "--node-modules", node_modules]
+        if preview_dir is not None:
+            command.extend(["--preview-dir", str(preview_dir)])
+        completed = subprocess.run(command, text=True, encoding="utf-8", errors="replace", capture_output=True, check=False)
+    if completed.returncode != 0:
+        message = completed.stderr.strip() or completed.stdout.strip() or "unknown node renderer failure"
+        raise RegionInferenceError(f"Workbook renderer failed: {message}")
+    try:
+        metadata = json.loads(completed.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise RegionInferenceError(f"Workbook renderer emitted no JSON metadata: {completed.stdout!r}") from exc
+    if not workbook.exists():
+        raise RegionInferenceError("Workbook renderer reported success without creating the XLSX file.")
+    ensure_workbook_frozen_headers(workbook)
+    cleanup_workbook_intermediates(workbook)
+    metadata["sha256"] = sha256_file(workbook)
+    return metadata
+
+
+def ensure_workbook_frozen_headers(workbook: Path) -> None:
+    """Repair artifact-tool's current missing freeze-pane serialization without altering cell content."""
+    with zipfile.ZipFile(workbook, "r") as source:
+        members = {member.filename: source.read(member.filename) for member in source.infolist()}
+    sheet_names = sorted(name for name in members if name.startswith("xl/worksheets/sheet") and name.endswith(".xml"))
+    if not sheet_names:
+        raise RegionInferenceError("Workbook freeze repair: no worksheet XML members found.")
+    changed = False
+    for sheet_name in sheet_names:
+        text = members[sheet_name].decode("utf-8")
+        if '<x:pane ' in text:
+            continue
+        marker = '<x:sheetView showGridLines="0" workbookViewId="0" />'
+        replacement = (
+            '<x:sheetView showGridLines="0" workbookViewId="0">'
+            '<x:pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen" />'
+            '</x:sheetView>'
+        )
+        if marker not in text:
+            raise RegionInferenceError(f"Workbook freeze repair: unsupported sheet view in {sheet_name}.")
+        members[sheet_name] = text.replace(marker, replacement, 1).encode("utf-8")
+        changed = True
+    if not changed:
+        return
+    with tempfile.NamedTemporaryFile(prefix="register-inference-freeze-", suffix=".xlsx", delete=False, dir=workbook.parent) as temporary:
+        temporary_path = Path(temporary.name)
+    try:
+        with zipfile.ZipFile(temporary_path, "w", compression=zipfile.ZIP_DEFLATED) as target:
+            for name, data in members.items():
+                target.writestr(name, data)
+        os.replace(temporary_path, workbook)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def cleanup_workbook_intermediates(workbook: Path) -> None:
+    """Remove the artifact-tool inspection sidecar; it is never a record deliverable."""
+    workbook.with_name(workbook.name + ".inspect.ndjson").unlink(missing_ok=True)
+
+
+def publish_workbook_delivery(workbook: Path, delivery: Path) -> str:
+    """Expose the generated workbook through a short same-volume hard-link for Excel."""
+    if workbook.resolve() == delivery.resolve():
+        return sha256_file(workbook)
+    delivery.parent.mkdir(parents=True, exist_ok=True)
+    if delivery.exists():
+        if os.path.samefile(workbook, delivery):
+            return sha256_file(delivery)
+        # ``--workbook-delivery`` is an explicit generated-output destination.
+        # A renderer may atomically replace the record copy, leaving the older
+        # delivery hard link behind; refresh that named delivery in either case.
+        delivery.unlink()
+    try:
+        os.link(workbook, delivery)
+    except OSError as exc:
+        raise RegionInferenceError(
+            f"Workbook delivery requires a same-volume hard link and could not be created: {delivery} ({exc})"
+        ) from exc
+    delivery_hash = sha256_file(delivery)
+    if delivery_hash != sha256_file(workbook):
+        raise RegionInferenceError("Workbook delivery SHA-256 mismatch.")
+    return delivery_hash
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="YAML region-inference configuration")
     parser.add_argument("--output", required=True, help="JSON output path")
+    parser.add_argument("--report", required=True, help="Required H13-style Markdown summary path for schema v3")
+    parser.add_argument("--workbook", required=True, help="Required complete Excel audit workbook path for schema v3")
+    parser.add_argument(
+        "--workbook-node", default=os.environ.get("REGISTER_INFERENCE_NODE", "node"),
+        help="Node executable for the artifact-tool workbook renderer (default: REGISTER_INFERENCE_NODE or node)",
+    )
+    parser.add_argument(
+        "--workbook-node-modules", default=os.environ.get("REGISTER_INFERENCE_NODE_MODULES"),
+        help="Node module directory containing @oai/artifact-tool (or REGISTER_INFERENCE_NODE_MODULES)",
+    )
+    parser.add_argument(
+        "--workbook-preview-dir", default=None,
+        help="Optional directory for artifact-tool PNG previews of every workbook sheet",
+    )
+    parser.add_argument(
+        "--workbook-delivery", default=None,
+        help="Optional short same-volume hard-link path for opening the workbook in Excel",
+    )
     args = parser.parse_args(argv)
     try:
         config_path = Path(args.config).resolve()
-        result = infer(load_config(config_path), config_path)
+        config = load_config(config_path)
+        if config["schema_version"] != 3:
+            raise RegionInferenceError("The required complete Markdown report is currently defined for schema_version 3 only.")
+        result = infer(config, config_path)
+        output = Path(args.output).resolve()
+        report = Path(args.report).resolve()
+        workbook = Path(args.workbook).resolve()
+        report_text, integrity = render_v3_report(result, config, config_path, report, output, workbook)
+        workbook_payload, expected_sheet_rows = build_v3_workbook_payload(result, config, config_path)
     except (RegionInferenceError, OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
         print(f"region-inference error: {exc}", file=sys.stderr)
         return 2
-    output = Path(args.output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(report_text, encoding="utf-8")
+    try:
+        workbook_metadata = render_v3_workbook(
+            workbook_payload, workbook,
+            node=args.workbook_node,
+            node_modules=args.workbook_node_modules,
+            preview_dir=Path(args.workbook_preview_dir).resolve() if args.workbook_preview_dir else None,
+        )
+    except (RegionInferenceError, OSError, subprocess.SubprocessError) as exc:
+        print(f"region-inference error: {exc}", file=sys.stderr)
+        return 2
+    if workbook_metadata.get("sheet_rows") != expected_sheet_rows:
+        print("region-inference error: workbook sheet-row metadata mismatch.", file=sys.stderr)
+        return 2
+    try:
+        delivery_path = Path(args.workbook_delivery).resolve() if args.workbook_delivery else None
+        delivery_sha256 = publish_workbook_delivery(workbook, delivery_path) if delivery_path else None
+    except (RegionInferenceError, OSError) as exc:
+        print(f"region-inference error: {exc}", file=sys.stderr)
+        return 2
+    result["report_artifact"] = {
+        "path": str(report), "sha256": sha256_file(report),
+        "integrity": integrity, "report_contract": "h13-style-summary-v2",
+    }
+    result["workbook_artifact"] = {
+        "path": str(workbook), "sha256": workbook_metadata["sha256"],
+        "sheet_rows": workbook_metadata["sheet_rows"], "integrity": integrity,
+        "workbook_contract": "complete-cycle-edge-audit-v1",
+    }
+    if delivery_path is not None:
+        result["workbook_artifact"]["delivery_path"] = str(delivery_path)
+        result["workbook_artifact"]["delivery_sha256"] = delivery_sha256
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print(f"Wrote {len(result['results'])} edge groups and {len(result['candidate_index'])} candidate-index entries to {output}")
+    print(
+        f"Wrote {len(result['results'])} edge groups, {len(result['candidate_index'])} candidate-index entries, "
+        f"H13-style Markdown summary, and complete Excel audit workbook to {output} / {report} / {workbook}"
+    )
     return 0
 
 

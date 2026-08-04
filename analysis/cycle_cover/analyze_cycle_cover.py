@@ -52,6 +52,12 @@ CYCLE_PALETTE = (
     "#5E35B1",
     "#546E7A",
 )
+BASE_OVERLAY_PALETTE = (
+    "#D81B60", "#1E88E5", "#D19A00", "#004D40", "#F4511E", "#7E57C2",
+    "#43A047", "#6D4C41", "#00ACC1", "#7A8B00", "#3949AB", "#FB8C00",
+    "#8E24AA", "#00897B", "#5E35B1", "#546E7A", "#E53935", "#039BE5",
+    "#C0CA33", "#00838F", "#6A1B9A", "#8D6E63", "#5C6BC0",
+)
 SignalMode = Literal["any", "input-and-output", "output-only"]
 SIGNAL_MODES = frozenset(("any", "input-and-output", "output-only"))
 MergedInputPolicy = Literal["first", "expand"]
@@ -2302,7 +2308,7 @@ def build_route_sequence_export(
     )
     _, transition_by_input = build_deterministic_input_graph(analysis.closure_model)
     lines: list[str] = []
-    route_entries: list[dict[str, Any]] = []
+    cycle_entries: list[dict[str, Any]] = []
     for route, route_start, nodes, edges, embedded_at in rotated:
         prefix_trace = access[route_start]
         prefix_inputs = [item[0] for item in prefix_trace]
@@ -2370,32 +2376,34 @@ def build_route_sequence_export(
                 variants.append(
                     {
                         "line_number": len(lines),
-                        "route_inputs": list(edge_inputs),
+                        "loop_inputs": list(edge_inputs),
                         "embedded_self_loop_input": loop_input,
                         "input_count": len(tokens),
                     }
                 )
-        route_entries.append(
-            {
-                **route_payload(route),
-                "cycle_start_state": route_start,
-                "rotated_nodes": list(nodes) + [nodes[0]],
-                "prefix_inputs": prefix_inputs,
-                "prefix_length": len(prefix_inputs),
-                "repeat_count": repeat_count,
-                "first_line": first_line,
-                "last_line": len(lines),
-                "variant_count": len(variants),
-                "variants": variants,
-            }
-        )
+        cycle_entry = route_payload(route)
+        cycle_entry.update({
+            "cycle_id": route.route_id,
+            "cycle_kind": route.route_kind,
+            "loop_length": len(edges),
+            "cycle_start_state": route_start,
+            "rotated_nodes": list(nodes) + [nodes[0]],
+            "prefix_inputs": prefix_inputs,
+            "prefix_length": len(prefix_inputs),
+            "repeat_count": repeat_count,
+            "first_line": first_line,
+            "last_line": len(lines),
+            "variant_count": len(variants),
+            "variants": variants,
+        })
+        cycle_entries.append(cycle_entry)
     return lines, {
         "start_state": start_state,
         "repeat_count": repeat_count,
         "merged_input_policy": merged_input_policy,
         "line_count": len(lines),
-        "route_count": len(routes),
-        "routes": route_entries,
+        "cycle_count": len(routes),
+        "cycles": cycle_entries,
         "validation": {
             "all_cycle_starts_reachable": True,
             "all_lines_simulated_against_closure_dot": True,
@@ -2486,6 +2494,135 @@ def build_route_smp_dot(
     return source_text[:closing] + "\n".join(additions) + source_text[closing:]
 
 
+def build_base_cycle_overlay_dot(
+    analysis: LayeredAnalysis,
+    routes: Sequence[Route],
+    basename: str,
+) -> str:
+    """Build one full-SMP overview with every base route shown by colour."""
+    if len(routes) > len(BASE_OVERLAY_PALETTE):
+        raise CycleCoverError("Base overlay palette has too few distinct colours.")
+    source_text = analysis.target_model.path.read_text(encoding="utf-8")
+    opening = source_text.find("{")
+    if opening < 0:
+        raise CycleCoverError(f"Target DOT is malformed: {analysis.target_model.path}")
+    route_colours = {
+        route.route_id: BASE_OVERLAY_PALETTE[index]
+        for index, route in enumerate(routes)
+    }
+    memberships: dict[tuple[str, str, str, str, int], list[str]] = defaultdict(list)
+    edge_by_key: dict[tuple[str, str, str, str, int], Transition] = {}
+    for route in routes:
+        for edge in route.edges:
+            key = concrete_edge_key(edge)
+            memberships[key].append(route.route_id)
+            edge_by_key[key] = edge
+    target_memberships = {
+        (edge.src, edge.dst, edge.label): route_ids
+        for key, route_ids in memberships.items()
+        if edge_by_key[key].kind == "target"
+        for edge in (edge_by_key[key],)
+    }
+    graph_attributes = (
+        '\n  graph [overlap=false, splines=true, bgcolor="white", '
+        'fontname="Microsoft YaHei", fontsize=20, labelloc="t", '
+        f'label="{dot_escape(basename)}｜基础组环总览\\n'
+        '实线彩色边=SMP 目标边；虚线彩色边=原始 DOT 补充边或独立自环；'
+        '多色边=被多个基础路线复用"];\n'
+        '  node [fontname="Microsoft YaHei", fontsize=12, color="#475569", penwidth=1.4];\n'
+        '  edge [fontname="Microsoft YaHei", fontsize=9, arrowsize=0.8];\n'
+    )
+    source_text = source_text[: opening + 1] + graph_attributes + source_text[opening + 1 :]
+
+    def recolor(match: re.Match[str]) -> str:
+        indent, src, dst, attrs = match.groups()
+        label_match = LABEL_RE.search(attrs)
+        label = unescape_dot_label(label_match.group(1)) if label_match else ""
+        route_ids = target_memberships.get((src, dst, label))
+        if not route_ids:
+            return (
+                f'{indent}{src} -> {dst} [{attrs}, color="black", '
+                'fontcolor="black", style="solid", penwidth=1.0];'
+            )
+        colours = ":".join(route_colours[route_id] for route_id in route_ids)
+        tooltip = ", ".join(route_ids)
+        return (
+            f'{indent}{src} -> {dst} [{attrs}, color="{colours}", '
+            'fontcolor="black", style="solid", penwidth=4.0, '
+            f'tooltip="{dot_escape(tooltip)}"];'
+        )
+
+    source_text = EDGE_STATEMENT_RE.sub(recolor, source_text)
+    closing = source_text.rfind("}")
+    if closing < 0:
+        raise CycleCoverError(f"Target DOT is malformed: {analysis.target_model.path}")
+    additions = ["", "  // Closure edges and self-loops used by the base group."]
+    for key, route_ids in sorted(
+        memberships.items(),
+        key=lambda item: (
+            state_key(edge_by_key[item[0]].src),
+            state_key(edge_by_key[item[0]].dst),
+            edge_by_key[item[0]].order,
+        ),
+    ):
+        edge = edge_by_key[key]
+        if edge.kind == "target":
+            continue
+        colours = ":".join(route_colours[route_id] for route_id in route_ids)
+        additions.append(
+            f'  {edge.src} -> {edge.dst} [label="{dot_escape(edge.label)}", '
+            f'color="{colours}", fontcolor="black", style="dashed", '
+            f'penwidth=4.0, tooltip="{dot_escape(", ".join(route_ids))}", '
+            'constraint=false];'
+        )
+    legend_rows = "".join(
+        '<TR><TD BGCOLOR="' + route_colours[route.route_id] + '"></TD><TD ALIGN="LEFT">'
+        + route.route_id + '：' + route.route_kind + '</TD></TR>'
+        for route in routes
+    )
+    additions.extend(
+        [
+            '  base_cycle_legend [shape=plain, margin=0, label=<',
+            '    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">',
+            '      <TR><TD COLSPAN="2"><B>基础组路线颜色</B></TD></TR>',
+            legend_rows,
+            '    </TABLE>',
+            '  >];',
+            '',
+        ]
+    )
+    return source_text[:closing] + "\n".join(additions) + source_text[closing:]
+
+
+def write_base_cycle_overlay(
+    analysis: LayeredAnalysis,
+    routes: Sequence[Route],
+    svg_output: Path,
+    basename: str,
+    engine: str,
+    overwrite: bool,
+) -> dict[str, Any]:
+    svg_path = svg_output.resolve()
+    dot_path = svg_path.with_suffix(".dot")
+    if (svg_path.exists() or dot_path.exists()) and not overwrite:
+        raise CycleCoverError(
+            "Base overlay output already exists; pass --overwrite to replace it: "
+            f"{svg_path}"
+        )
+    dot_path.parent.mkdir(parents=True, exist_ok=True)
+    dot_text = build_base_cycle_overlay_dot(analysis, routes, basename)
+    dot_path.write_text(dot_text, encoding="utf-8")
+    render_svg(dot_text, svg_path, engine)
+    return {
+        "dot": artifact_record(dot_path, dot_path.parent),
+        "svg": artifact_record(svg_path, svg_path.parent),
+        "route_colours": {
+            route.route_id: BASE_OVERLAY_PALETTE[index]
+            for index, route in enumerate(routes)
+        },
+    }
+
+
 def write_layered_report(payload: dict[str, Any], path: Path) -> None:
     sequence = payload["sequence_export"]
     lines = [
@@ -2504,7 +2641,7 @@ def write_layered_report(payload: dict[str, Any], path: Path) -> None:
         "| ID | 类型 | 长度 | 覆盖目标边 | 序列行 | SVG |",
         "|---|---|---:|---|---:|---|",
     ]
-    sequence_by_id = {entry["route_id"]: entry for entry in sequence["routes"]}
+    sequence_by_id = {entry["cycle_id"]: entry for entry in sequence["cycles"]}
     for route in payload["routes"]:
         sequence_entry = sequence_by_id[route["route_id"]]
         target_text = ", ".join(route["target_edge_ids"]) or "—"
@@ -2692,6 +2829,14 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Independent .seq output for all additional short-cycle routes.",
     )
+    parser.add_argument(
+        "--base-overlay-output",
+        type=Path,
+        help=(
+            "Optional combined full-SMP SVG for the base group. The matching "
+            ".dot derivative is written beside it."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -2737,6 +2882,20 @@ def main() -> None:
             extra_basename=args.extra_basename,
             extra_sequence_output=args.extra_sequence_output,
         )
+        if args.base_overlay_output is not None:
+            base_routes = (
+                analysis.base_simple_routes
+                + analysis.base_fallback_routes
+                + analysis.standalone_self_loops
+            )
+            summary["base_overlay"] = write_base_cycle_overlay(
+                analysis,
+                base_routes,
+                args.base_overlay_output,
+                args.basename or args.dot.stem,
+                args.engine,
+                args.overwrite,
+            )
     else:
         result = analyze_cycle_cover(
             dot_path=args.dot,

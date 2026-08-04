@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import contextlib
+import io
+import os
 import sys
 import tempfile
 import unittest
@@ -15,20 +18,31 @@ REAL_CONFIG = Path(
     "D:/state-learning-lab/projects/state-learning-experiments/experiments/open5gs/"
     "ueransim-smc-context-pdu-selection/open5gs266-smc-context-h13-interrupted-20260730/"
     "followups/cycle-cover-repeat10-register-analysis-20260731/analysis/derived/"
-    "register_inference/c01-c02-ngksi-signal-inference.yaml"
+    "register_inference/c01-c14-ngksi-signal-inference.yaml"
+)
+H14_CONFIG = Path(
+    "D:/state-learning-lab/projects/state-learning-experiments/experiments/open5gs/"
+    "ueransim-smc-context-pdu-selection/open5gs266-smc-context-h13-interrupted-20260730/"
+    "followups/h14-base-cycle-cover-runtime-verify-20260804/analysis/derived/"
+    "register_inference/h14-base-ngksi-signal-inference.yaml"
 )
 sys.path.insert(0, str(EXPERIMENT_DIR))
 
 from infer_cycle_ngksi_regions import (
     RegionInferenceError,
+    build_v3_workbook_payload,
     build_regions,
     candidate_status,
+    cleanup_workbook_intermediates,
     default_signal_tree,
     effective_snapshot,
     guarded_candidates,
     infer,
     load_config,
+    main,
     numeric_input_observations,
+    publish_workbook_delivery,
+    render_v3_report,
     signal_gated_candidates,
     signal_observations,
     standalone_event_sample,
@@ -111,6 +125,93 @@ def _region(repetition: int, before: int, after: int, *, signals: list[dict] | N
 
 
 class CycleNgksiRegionTests(unittest.TestCase):
+    @unittest.skipUnless(H14_CONFIG.exists(), "H14 complete-cycle fixture is not available")
+    def test_h14_summary_report_and_workbook_contract(self) -> None:
+        config = load_config(H14_CONFIG)
+        result = infer(config, H14_CONFIG)
+        report, integrity = render_v3_report(result, config, H14_CONFIG)
+        payload, sheet_rows = build_v3_workbook_payload(result, config, H14_CONFIG)
+        self.assertEqual(
+            {"edge_group_count": 52, "cycle_count": 23, "cycle_variant_count": 37, "cycle_edge_usage_count": 90},
+            integrity,
+        )
+        self.assertIn('<table id="edge-summary" style="width:100%; table-layout:fixed">', report)
+        self.assertEqual(1, report.count('<table id='))
+        self.assertEqual(1, report.count("<code>E0073</code>"))
+        self.assertIn("直接观察冲突", report)
+        self.assertIn("相对稳定", report)
+        self.assertIn("假设性", report)
+        self.assertIn("unknown", report)
+        self.assertIn("r_i&#x27; = i", report)
+        self.assertNotIn("unknown/unobserved_signal_branch", report)
+        self.assertNotIn("partial_observational_candidate", report)
+        self.assertNotIn("observationally_exact_candidate", report)
+        self.assertNotIn("r_i[ngksi_uplink]", report)
+        self.assertNotIn("direct_input_observation", report)
+        self.assertNotIn("carried_input_register", report)
+        self.assertIn("交集", report)
+        self.assertIn("/<br>", report)
+        self.assertIn("<colgroup>", report)
+        self.assertEqual(
+            {"概览": 9, "边级协调": 52, "循环-边使用": 90, "变体": 37, "候选明细": 195, "协调证据": 50},
+            sheet_rows,
+        )
+        sheets = {sheet["name"]: sheet for sheet in payload["sheets"]}
+        self.assertEqual(["概览", "边级协调", "循环-边使用", "变体", "候选明细", "协调证据"], list(sheets))
+        self.assertIn("候选类型", sheets["边级协调"]["headers"])
+        self.assertIn("候选类型", sheets["循环-边使用"]["headers"])
+        self.assertIn("候选类型", sheets["候选明细"]["headers"])
+        self.assertIn("候选类型：相对稳定", {row[0] for row in sheets["概览"]["rows"]})
+        self.assertIn("候选类型：假设性", {row[0] for row in sheets["概览"]["rows"]})
+        workbook_text = "\n".join(
+            cell for sheet in sheets.values() for row in sheet["rows"] for cell in row
+        )
+        self.assertNotIn("unknown/unobserved_signal_branch", workbook_text)
+        self.assertNotIn("r_i[ngksi_uplink]", workbook_text)
+        self.assertNotIn("direct_input_observation", workbook_text)
+        self.assertNotIn("carried_input_register", workbook_text)
+        e0038 = next(row for row in sheets["边级协调"]["rows"] if row[0] == "E0038")
+        self.assertEqual("r_i' = i", e0038[7])
+        self.assertTrue(any(row[0] == "E0073" and row[1] == "直接观察冲突" for row in sheets["协调证据"]["rows"]))
+        self.assertTrue(any(row[0] == "S008" and row[4] == "E0073" for row in sheets["循环-边使用"]["rows"]))
+        self.assertTrue(any(row[0] == "S036" and row[4] == "E0073" for row in sheets["循环-边使用"]["rows"]))
+
+    @unittest.skipUnless(H14_CONFIG.exists(), "H14 complete-cycle fixture is not available")
+    def test_cli_requires_report_and_workbook(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                main(["--config", str(H14_CONFIG), "--output", str(Path(temp) / "result.json")])
+            with self.assertRaises(SystemExit):
+                main([
+                    "--config", str(H14_CONFIG), "--output", str(Path(temp) / "result.json"),
+                    "--report", str(Path(temp) / "summary.md"),
+                ])
+
+    def test_workbook_delivery_relinks_a_stale_same_byte_hard_link(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first = root / "first.xlsx"
+            replacement = root / "replacement.xlsx"
+            delivery = root / "delivery.xlsx"
+            first.write_bytes(b"same workbook bytes")
+            replacement.write_bytes(b"same workbook bytes")
+            publish_workbook_delivery(first, delivery)
+            self.assertTrue(os.path.samefile(first, delivery))
+            publish_workbook_delivery(replacement, delivery)
+            self.assertTrue(os.path.samefile(replacement, delivery))
+            changed = root / "changed.xlsx"
+            changed.write_bytes(b"new workbook bytes")
+            publish_workbook_delivery(changed, delivery)
+            self.assertTrue(os.path.samefile(changed, delivery))
+
+    def test_workbook_inspection_sidecar_is_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            workbook = Path(temp) / "audit.xlsx"
+            sidecar = Path(str(workbook) + ".inspect.ndjson")
+            sidecar.write_text('{"intermediate": true}\n', encoding="utf-8")
+            cleanup_workbook_intermediates(workbook)
+            self.assertFalse(sidecar.exists())
+
     @unittest.skipUnless(REAL_CONFIG.exists(), "C01/C02 frozen integration fixture is not available")
     def test_real_c01_c14_trace_end_to_end(self) -> None:
         result = infer(load_config(REAL_CONFIG), REAL_CONFIG)

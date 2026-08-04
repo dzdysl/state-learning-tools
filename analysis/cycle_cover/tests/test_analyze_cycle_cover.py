@@ -925,8 +925,32 @@ class LayeredRouteTests(unittest.TestCase):
             self.assertTrue((root / "extra.seq").is_file())
             self.assertTrue((root / "base" / "base_cycle_cover.json").is_file())
             self.assertTrue((root / "extra" / "extra_cycle_cover.json").is_file())
+            base_payload = json.loads((root / "base" / "base_cycle_cover.json").read_text(encoding="utf-8"))
+            self.assertIn("cycles", base_payload["sequence_export"])
+            self.assertNotIn("routes", base_payload["sequence_export"])
+            self.assertEqual(
+                base_payload["sequence_export"]["cycles"][0]["cycle_id"],
+                base_payload["sequence_export"]["cycles"][0]["route_id"],
+            )
+            self.assertIn("loop_inputs", base_payload["sequence_export"]["cycles"][0]["variants"][0])
             for svg in list((root / "base" / "cycles").glob("*.svg")) + list((root / "extra" / "cycles").glob("*.svg")):
                 self.assertTrue(ET.parse(svg).getroot().tag.endswith("svg"))
+            base_routes = (
+                analysis.base_simple_routes
+                + analysis.base_fallback_routes
+                + analysis.standalone_self_loops
+            )
+            overlay = cycle_cover.write_base_cycle_overlay(
+                analysis,
+                base_routes,
+                root / "base_overlay.svg",
+                "base",
+                "dot",
+                False,
+            )
+            self.assertEqual(len(base_routes), len(overlay["route_colours"]))
+            self.assertTrue(ET.parse(root / "base_overlay.svg").getroot().tag.endswith("svg"))
+            self.assertTrue((root / "base_overlay.dot").is_file())
 
 
 @unittest.skipUnless(H14_AVAILABLE, "H14 experiment evidence is not available")

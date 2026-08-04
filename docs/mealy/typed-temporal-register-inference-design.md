@@ -301,13 +301,53 @@ C04 的 E0073 已显示同一推断区域可包含多个事件输入和多个伴
 
 ## 复现与维护
 
+### 严格的原始数据转换边界
+
+推断器的 `inputs.trace` 不是“任意整理后的轨迹”。它必须是冻结运行快照中
+`statelearner_trace.jsonl` 的字节一致证据副本；`cleaned`、筛选、CSV、按消息重排、
+根据日志/pcap 回填字段的文件均不是合法输入。转换只允许在内存中为当前计算增加
+JSONL 行号，以及将**配置指定**字段解析为整数或布尔值；原始记录的键、值、顺序和
+分组不得写回修改。
+
+在调用推断器前，必须运行 `prepare_register_inference_trace.py`。它以同一个 YAML
+配置核对 `inputs.trace`、`inputs.sequence_file` 与 `inputs.cycle_cover`：接口只能是
+`sequence_export.cycles`，每个选中 `cycle_id` 的每个 `line_number` 必须唯一匹配一个
+`sequence_id` 组，组末 `sequence_inputs`、组内记录数和逐步
+`abstract_io.input` 都必须与 `.seq` 一致。失败时停止推断，不得手工挑选“看起来正常”
+的记录。其转换清单记录源/目标 SHA-256、字节数、记录数、组数与匹配关系。
+
+该检查将归档、转换和初始脚本的实际输入契约绑定在一起：随后
+`infer_cycle_ngksi_regions.py` 直接读取已物化的完整 JSONL，而不是读取转换后的中间
+表。这样，区域中的 `trace_line` 始终能回指到不可变证据中的同一物理行。
+
 运行方式：
 
 ```powershell
+D:\anaconda3\python.exe D:\state-learning-lab\projects\state-learning-tools\analysis\register_inference\experiments\prepare_register_inference_trace.py `
+  --config <record>\analysis\derived\register_inference\c01-c14-ngksi-signal-inference.yaml `
+  --source-trace D:\state-learning-lab\run-data\<platform>\<run-id>\statelearner_trace.jsonl `
+  --evidence-trace <record>\evidence\statelearner_trace.jsonl `
+  --manifest <record>\analysis\derived\register_inference\c01-c14-trace-materialization.json
+
 D:\anaconda3\python.exe D:\state-learning-lab\projects\state-learning-tools\analysis\register_inference\experiments\infer_cycle_ngksi_regions.py `
-  --config <record>\analysis\derived\register_inference\c01-c02-ngksi-signal-inference.yaml `
-  --output <record>\analysis\derived\register_inference\c01-c02-ngksi-signal-candidates.json
+  --config <record>\analysis\derived\register_inference\c01-c14-ngksi-signal-inference.yaml `
+  --output <record>\analysis\derived\register_inference\c01-c14-ngksi-signal-candidates.json `
+  --report <record>\analysis\derived\register_inference\c01-c14-ngksi-signal-summary.md `
+  --workbook <record>\analysis\derived\register_inference\c01-c14-ngksi-signal-details.xlsx
 ```
 
-修改候选语言、排序规则、槽位身份或未知分支语义时，必须同步更新：适配器测试、
-`analysis/register_inference/experiments/AGENTS.md`、本文件，以及使用该适配器的实验总结。
+对于 schema v3，`--report` 与 `--workbook` 都是必填项。Markdown 按 H13 的四列固定布局
+HTML 格式摘要全部具体边组；完整审计工作簿以 `cycle_id` 为主键，分别保存边级协调、循环—边
+使用、`V01…` 变体、逐公式候选及协调证据。同一边在不同循环中分别列出，且所有全局、交集、
+非共识和局部并列公式都不得折叠或选择其一。`hypothetical_candidate` 与
+`relatively_stable_candidate` 必须作为 Excel 的独立候选类型列；不以物理 `.seq` 行号作为阅读主键。
+交集为空与 `confirmed_observational_conflict` 必须分开标注；前者不自动成为矛盾。
+
+面向读者的 Markdown 与 Excel 统一使用展示简写：`unknown/<reason>` 显示为 `unknown`，
+`r_i[ngksi_uplink]` 显示为 `r_i`，输入寄存器更新不显示括号内的观察来源；候选类型、观测状态、
+协调状态、路线类型和作用域显示为简明中文。候选 JSON 仍保存未压缩的公式树、状态枚举、观察原因和
+更新来源；展示简写不改变推断语义或证据边界。
+
+修改候选语言、排序规则、槽位身份、转换契约或未知分支语义时，必须同步更新：
+预处理器与适配器测试、`analysis/register_inference/experiments/AGENTS.md`、本文件，
+以及使用该适配器的实验总结。
