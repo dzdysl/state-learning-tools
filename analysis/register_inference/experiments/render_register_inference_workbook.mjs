@@ -31,10 +31,10 @@ async function sha256File(filePath) {
 }
 
 function gradeFill(value) {
-  if (value === "relatively_stable_candidate") {
+  if (value === "relatively_stable_candidate" || value === "相对稳定") {
     return "#D9EAD3";
   }
-  if (value === "hypothetical_candidate") {
+  if (value === "hypothetical_candidate" || value === "假设性") {
     return "#FFF2CC";
   }
   return null;
@@ -66,6 +66,8 @@ async function main() {
     sheet.getRange(tableRange).values = [spec.headers, ...spec.rows];
     sheet.showGridLines = false;
     sheet.getRange(tableRange).format.wrapText = true;
+    sheet.getRange(tableRange).format.horizontalAlignment = "center";
+    sheet.getRange(tableRange).format.verticalAlignment = "center";
     sheet.getRange(`A1:${lastColumn}1`).format = {
       fill: "#0F4C5C",
       font: { bold: true, color: "#FFFFFF" },

@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 import yaml
@@ -22,9 +23,8 @@ REAL_CONFIG = Path(
 )
 H14_CONFIG = Path(
     "D:/state-learning-lab/projects/state-learning-experiments/experiments/open5gs/"
-    "ueransim-smc-context-pdu-selection/open5gs266-smc-context-h13-interrupted-20260730/"
-    "followups/h14-base-cycle-cover-runtime-verify-20260804/analysis/derived/"
-    "register_inference/h14-base-ngksi-signal-inference.yaml"
+    "ueransim-smc-context-pdu-selection/h14-base-runtime-20260804/"
+    "analysis/register-inference/config.yaml"
 )
 sys.path.insert(0, str(EXPERIMENT_DIR))
 
@@ -36,6 +36,7 @@ from infer_cycle_ngksi_regions import (
     cleanup_workbook_intermediates,
     default_signal_tree,
     effective_snapshot,
+    ensure_workbook_frozen_headers,
     guarded_candidates,
     infer,
     load_config,
@@ -43,11 +44,14 @@ from infer_cycle_ngksi_regions import (
     numeric_input_observations,
     publish_workbook_delivery,
     render_v3_report,
+    set_valued_numeric_candidates,
     signal_gated_candidates,
     signal_observations,
     standalone_event_sample,
     stable_slots,
     tree_text,
+    unique_sorted_trees,
+    validate_v3_analysis,
     validate_signal_definitions,
     validate_numeric_input_definitions,
     validate_observation_alignment,
@@ -138,7 +142,10 @@ class CycleNgksiRegionTests(unittest.TestCase):
         self.assertIn('<table id="edge-summary" style="width:100%; table-layout:fixed">', report)
         self.assertEqual(1, report.count('<table id='))
         self.assertEqual(1, report.count("<code>E0073</code>"))
-        self.assertIn("直接观察冲突", report)
+        self.assertIn("联合拟合失败", report)
+        self.assertIn("相对稳定推断迁移检验", report)
+        self.assertNotIn("分区分歧", report)
+        self.assertNotIn("观察冲突", report)
         self.assertIn("相对稳定", report)
         self.assertIn("假设性", report)
         self.assertIn("unknown", report)
@@ -152,17 +159,17 @@ class CycleNgksiRegionTests(unittest.TestCase):
         self.assertIn("交集", report)
         self.assertIn("/<br>", report)
         self.assertIn("<colgroup>", report)
-        self.assertEqual(
-            {"概览": 9, "边级协调": 52, "循环-边使用": 90, "变体": 37, "候选明细": 195, "协调证据": 50},
-            sheet_rows,
-        )
+        self.assertEqual({"循环边使用": 90}, sheet_rows)
         sheets = {sheet["name"]: sheet for sheet in payload["sheets"]}
-        self.assertEqual(["概览", "边级协调", "循环-边使用", "变体", "候选明细", "协调证据"], list(sheets))
-        self.assertIn("候选类型", sheets["边级协调"]["headers"])
-        self.assertIn("候选类型", sheets["循环-边使用"]["headers"])
-        self.assertIn("候选类型", sheets["候选明细"]["headers"])
-        self.assertIn("候选类型：相对稳定", {row[0] for row in sheets["概览"]["rows"]})
-        self.assertIn("候选类型：假设性", {row[0] for row in sheets["概览"]["rows"]})
+        self.assertEqual(["循环边使用"], list(sheets))
+        cycle_sheet = sheets["循环边使用"]
+        self.assertIn("候选类型", cycle_sheet["headers"])
+        self.assertIn("候选生成结果", cycle_sheet["headers"])
+        self.assertIn("相对稳定推断来源边", cycle_sheet["headers"])
+        self.assertIn("相对稳定推断", cycle_sheet["headers"])
+        self.assertIn("迁移检验", cycle_sheet["headers"])
+        self.assertNotIn("环内序号", cycle_sheet["headers"])
+        self.assertEqual([10, 14, 12, 10, 8, 8, 18, 20, 12], cycle_sheet["widths"][:9])
         workbook_text = "\n".join(
             cell for sheet in sheets.values() for row in sheet["rows"] for cell in row
         )
@@ -170,22 +177,108 @@ class CycleNgksiRegionTests(unittest.TestCase):
         self.assertNotIn("r_i[ngksi_uplink]", workbook_text)
         self.assertNotIn("direct_input_observation", workbook_text)
         self.assertNotIn("carried_input_register", workbook_text)
-        e0038 = next(row for row in sheets["边级协调"]["rows"] if row[0] == "E0038")
-        self.assertEqual("r_i' = i", e0038[7])
-        self.assertTrue(any(row[0] == "E0073" and row[1] == "直接观察冲突" for row in sheets["协调证据"]["rows"]))
-        self.assertTrue(any(row[0] == "S008" and row[4] == "E0073" for row in sheets["循环-边使用"]["rows"]))
-        self.assertTrue(any(row[0] == "S036" and row[4] == "E0073" for row in sheets["循环-边使用"]["rows"]))
+        self.assertIn(" ｜ ", workbook_text)
+        self.assertIn("反推状态", cycle_sheet["headers"])
+        self.assertIn("反推候选与假设", cycle_sheet["headers"])
+        s008_e0073 = next(row for row in cycle_sheet["rows"] if row[0] == "S008" and row[3] == "E0073")
+        s036_e0073 = next(row for row in cycle_sheet["rows"] if row[0] == "S036" and row[3] == "E0073")
+        s008_e0002 = next(row for row in cycle_sheet["rows"] if row[0] == "S008" and row[3] == "E0002")
+        self.assertEqual("假设性", s008_e0073[8])
+        self.assertEqual("迁移失败，执行前序反推", s008_e0073[14])
+        self.assertIn("8/8 个样本不匹配", s008_e0073[15])
+        self.assertEqual("迁移成功", s036_e0073[14])
+        self.assertIn("16/16 个样本成立", s036_e0073[15])
+        self.assertEqual("已生成 6 个候选", s008_e0002[16])
+        self.assertIn("允许输出：{6,7}", s008_e0002[17])
+        self.assertIn("E0016 r'=r", s008_e0002[17])
+        self.assertIn("前序反推分支", report)
+
+        by_edge = {item["edge"]["edge_id"]: item for item in result["results"]}
+        stable_summary = result["relatively_stable_inference"]
+        self.assertEqual(3, len(stable_summary["groups"]))
+        self.assertEqual(9, stable_summary["target_edge_count"])
+        self.assertEqual(22, stable_summary["target_partition_count"])
+        self.assertEqual(
+            {
+                "migration_failed": 1,
+                "migration_succeeded": 4,
+                "no_matching_relatively_stable_inference": 17,
+            },
+            stable_summary["migration_status_counts"],
+        )
+        self.assertEqual([7], stable_summary["dynamic_t_preference"]["values"])
+        self.assertEqual(
+            [
+                "preferred_exact_constant_assignment",
+                "preferred_derived_guard_value",
+                "default_complexity_order",
+            ],
+            stable_summary["dynamic_t_preference"]["ranking_policy"],
+        )
+        groups = {
+            (tuple((item["signal_id"], item["value"]) for item in group["signal_context"]),
+             group["logical_input"], group["logical_output"]): group
+            for group in stable_summary["groups"]
+        }
+        self.assertEqual(0, groups[((), "authenticationResponse", "securityModeCommand")]["target_partition_count"])
+        self.assertEqual(
+            2,
+            groups[(("isInitMsg", 0),), "registrationRequestGUTI", "authenticationRequest"]["target_partition_count"],
+        )
+        self.assertEqual("hypothetical_candidate", by_edge["E0073"]["candidate_grade"])
+        resolution = by_edge["E0073"]["hypothetical_candidate_resolution"]
+        self.assertEqual("combined_sample_fit_failed", resolution["selection"]["status"])
+        self.assertTrue(resolution["selection"]["error"]["continue_to_migration_and_backward_inference"])
+        migration = by_edge["E0073"]["relatively_stable_inference_migration"]
+        partitions = {item["cycle_id"]: item for item in migration["cycle_results"]}
+        self.assertEqual("migration_failed", partitions["S008"]["status"])
+        self.assertEqual("migration_succeeded", partitions["S036"]["status"])
+        first = partitions["S008"]["failing_candidates"][0]["counterexamples"][0]
+        self.assertEqual(
+            {"r_before": 0, "predicted_r_after": 1, "observed_r_after": 0},
+            {key: first[key] for key in ("r_before", "predicted_r_after", "observed_r_after")},
+        )
+        no_matching = {
+            (item["edge"]["edge_id"], partition["cycle_id"])
+            for item in result["results"]
+            for partition in (item.get("relatively_stable_inference_migration") or {}).get("cycle_results", [])
+            if partition["status"] == "no_matching_relatively_stable_inference"
+        }
+        self.assertEqual(17, len(no_matching))
+        self.assertIn(("E0001", "S018"), no_matching)
+        self.assertIn(("E0085", "S039"), no_matching)
+        self.assertIn(("E0181", "S039"), no_matching)
+        backward = by_edge["E0002"]["backward_inference"]["attempts"]
+        self.assertEqual(1, len(backward))
+        attempt = backward[0]
+        self.assertEqual("E0073:S008:E0002", attempt["inference_id"])
+        self.assertEqual(["E0016"], [held["edge"]["edge_id"] for held in attempt["held_predecessors"]])
+        self.assertTrue(all(sample["allowed_r_after_values"] == [6, 7] for sample in attempt["samples"]))
+        self.assertEqual(
+            ["r' = 7", "r' = 6", "r' = r + 6", "r' = r + 7", "r' = r_i[ngksi_uplink] - 1", "r' = r_i[ngksi_uplink]"],
+            [candidate["branch_update_text"] for candidate in attempt["candidates"]],
+        )
+        self.assertTrue(attempt["candidates"][0]["preference"]["preferred"])
+        self.assertEqual("preferred_exact_constant_assignment", attempt["candidates"][0]["preference"]["reason"])
 
     @unittest.skipUnless(H14_CONFIG.exists(), "H14 complete-cycle fixture is not available")
-    def test_cli_requires_report_and_workbook(self) -> None:
+    def test_cli_requires_report_but_workbook_is_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as temp, contextlib.redirect_stderr(io.StringIO()):
+            root = Path(temp)
             with self.assertRaises(SystemExit):
-                main(["--config", str(H14_CONFIG), "--output", str(Path(temp) / "result.json")])
-            with self.assertRaises(SystemExit):
-                main([
-                    "--config", str(H14_CONFIG), "--output", str(Path(temp) / "result.json"),
-                    "--report", str(Path(temp) / "summary.md"),
-                ])
+                main(["--config", str(H14_CONFIG), "--output", str(root / "result.json")])
+            self.assertEqual(0, main([
+                "--config", str(H14_CONFIG), "--output", str(root / "result.json"),
+                "--report", str(root / "summary.md"),
+            ]))
+            result = json.loads((root / "result.json").read_text(encoding="utf-8"))
+            self.assertNotIn("workbook_artifact", result)
+            self.assertIn("本次未请求 Excel 审计工作簿", (root / "summary.md").read_text(encoding="utf-8"))
+            self.assertEqual(2, main([
+                "--config", str(H14_CONFIG), "--output", str(root / "other.json"),
+                "--report", str(root / "other.md"),
+                "--workbook-preview-dir", str(root / "preview"),
+            ]))
 
     def test_workbook_delivery_relinks_a_stale_same_byte_hard_link(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -211,6 +304,77 @@ class CycleNgksiRegionTests(unittest.TestCase):
             sidecar.write_text('{"intermediate": true}\n', encoding="utf-8")
             cleanup_workbook_intermediates(workbook)
             self.assertFalse(sidecar.exists())
+
+    def test_workbook_repair_adds_freeze_pane_and_table_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            workbook = Path(temp) / "audit.xlsx"
+            with zipfile.ZipFile(workbook, "w") as archive:
+                archive.writestr(
+                    "xl/worksheets/sheet1.xml",
+                    '<x:worksheet xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                    '<x:sheetViews><x:sheetView showGridLines="0" workbookViewId="0" /></x:sheetViews>'
+                    '</x:worksheet>',
+                )
+                archive.writestr(
+                    "xl/tables/table1.xml",
+                    '<x:table xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ref="A1:P91">'
+                    '<x:tableColumns count="1"><x:tableColumn id="1" name="循环" /></x:tableColumns>'
+                    '</x:table>',
+                )
+            ensure_workbook_frozen_headers(workbook)
+            with zipfile.ZipFile(workbook) as archive:
+                sheet_xml = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+                table_xml = archive.read("xl/tables/table1.xml").decode("utf-8")
+            self.assertIn('state="frozen"', sheet_xml)
+            self.assertIn('autoFilter ref="A1:P91"', table_xml)
+
+    def test_v3_rejects_static_derived_guard_preference(self) -> None:
+        with self.assertRaisesRegex(RegionInferenceError, "not configurable"):
+            validate_v3_analysis({"preferred_derived_guard_values": [7]})
+
+    def test_v3_backward_inference_policy_is_closed(self) -> None:
+        with self.assertRaisesRegex(RegionInferenceError, "predecessor_policy"):
+            validate_v3_analysis({
+                "backward_inference": {
+                    "enabled": True,
+                    "value_domain": "observed_global",
+                    "predecessor_policy": "any_predecessor",
+                    "earlier_predecessor_policy": "hold",
+                    "signal_scope": "observed_reference_branches_only",
+                },
+            })
+
+    def test_dynamic_t_orders_exact_constant_then_matching_guard_tree(self) -> None:
+        tree_five = {
+            "kind": "derived_value_guard",
+            "guard": {
+                "variable": "input_register", "input_register_id": "ksi",
+                "operator": "==", "value": 5,
+            },
+            "true": {"kind": "leaf", "formula": {"kind": "constant", "value": 1}},
+            "false": {"kind": "leaf", "formula": {"kind": "constant", "value": 0}},
+        }
+        tree_seven = {
+            **tree_five,
+            "guard": {**tree_five["guard"], "value": 7},
+        }
+        constant_seven = {"kind": "leaf", "formula": {"kind": "constant", "value": 7}}
+        ordered = unique_sorted_trees([tree_five, constant_seven, tree_seven], [7])
+        self.assertIs(constant_seven, ordered[0])
+        self.assertIs(tree_seven, ordered[1])
+        self.assertIs(tree_five, ordered[2])
+
+    def test_set_valued_backward_search_reports_no_exact_candidate(self) -> None:
+        samples = []
+        for repetition, before, allowed in ((2, 0, [0]), (3, 1, [3]), (4, 2, [0])):
+            sample = _region(repetition, before, 0)
+            sample["allowed_r_after_values"] = allowed
+            sample["input_register_values"] = {}
+            samples.append(sample)
+        self.assertEqual(
+            [],
+            set_valued_numeric_candidates(samples, [], list(range(8)), 3, 1, 1, [7]),
+        )
 
     @unittest.skipUnless(REAL_CONFIG.exists(), "C01/C02 frozen integration fixture is not available")
     def test_real_c01_c14_trace_end_to_end(self) -> None:
@@ -245,24 +409,31 @@ class CycleNgksiRegionTests(unittest.TestCase):
         self.assertEqual([], c04_registration["candidates"])
         self.assertEqual((0, 0), (c04_registration["direct_regions"][0]["previous_output"]["value"], c04_registration["direct_regions"][0]["terminal_output"]["value"]))
         self.assertIn((0, 1), {(sample["previous_output"]["value"], sample["terminal_output"]["value"]) for sample in c04_registration["direct_regions"]})
-        reconciliation = c04_registration["hypothetical_reconciliation"]
-        self.assertEqual("confirmed_observational_conflict", reconciliation["reconciliation_status"])
-        self.assertEqual([], reconciliation["intersection_candidates"])
-        partitions = {partition["cycle_id"]: partition for partition in reconciliation["partitions"]}
+        resolution = c04_registration["hypothetical_candidate_resolution"]
+        self.assertEqual([], resolution["intersection_candidates"])
+        partitions = {partition["cycle_id"]: partition for partition in resolution["cycle_candidates"]}
         self.assertEqual({"C04", "C14"}, set(partitions))
         self.assertTrue(any("r' = r" in candidate["update_tree_text"] for candidate in partitions["C04"]["candidates"]))
         self.assertTrue(any("if r < 6:" in candidate["update_tree_text"] for candidate in partitions["C14"]["candidates"]))
-        conflict = reconciliation["observational_conflicts"][0]
-        self.assertEqual([0, 1], conflict["r_after_values"])
-        self.assertEqual(0, conflict["observation"]["r_before"])
-        self.assertEqual(7, conflict["observation"]["numeric_inputs"][0]["value"])
-        self.assertEqual({"C04", "C14"}, {item["cycle_id"] for item in conflict["evidence"]})
+        self.assertTrue(resolution["combined_sample_fit"]["triggered"])
+        self.assertEqual("combined_sample_fit_failed", resolution["combined_sample_fit"]["status"])
+        self.assertEqual([], resolution["combined_sample_fit"]["candidates"])
+        self.assertEqual("combined_sample_fit_failed", resolution["selection"]["status"])
+        self.assertNotIn("hypothetical_reconciliation", c04_registration)
         self.assertIn("unknown/unanchored_signal_context", by_edge["E0002"]["candidates"][0]["update_tree_text"])
         self.assertEqual("r_i[ngksi_uplink]' = i", by_edge["E0002"]["candidates"][0]["input_register_updates"][0]["update"]["text"])
         self.assertEqual("r' = r", by_edge["E0016"]["candidates"][0]["update_tree_text"])
         self.assertEqual("r_i[ngksi_uplink]' = r_i[ngksi_uplink]", by_edge["E0016"]["candidates"][0]["input_register_updates"][0]["update"]["text"])
         self.assertEqual(2, len(by_edge["E0083"]["candidates"]))
         self.assertTrue(all("r_i[ngksi_uplink] < 6" in candidate["update_tree_text"] for candidate in by_edge["E0083"]["candidates"]))
+        e0083_reconciliation = by_edge["E0083"]["hypothetical_candidate_resolution"]
+        self.assertEqual(
+            "fit_cycle_minimal_candidates_then_combine_samples_if_intersection_empty",
+            e0083_reconciliation["strategy"],
+        )
+        self.assertEqual([], e0083_reconciliation["intersection_candidates"])
+        self.assertTrue(e0083_reconciliation["combined_sample_fit"]["triggered"])
+        self.assertEqual(2, len(e0083_reconciliation["combined_sample_fit"]["candidates"]))
         c06_registration = by_edge["E0085"]
         self.assertEqual("hypothetical_candidate", c06_registration["candidates"][0]["candidate_grade"])
         self.assertEqual(2, len(c06_registration["candidates"]))

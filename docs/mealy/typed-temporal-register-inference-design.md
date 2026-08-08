@@ -128,19 +128,32 @@ r' = r_i + k
 结果中的 `candidate_index` 以有序 `guard_path + update_tree + input_register_updates + status + grade`
 聚合具体 DOT 边集合；相同候选在多个边上出现时共享同一索引项，但每个边的区域与覆盖证据仍完整保留。
 
-### 假设性候选的交集、分歧与冲突
+### 假设性候选协调
 
-对 `hypothetical_candidate`，顶层 `candidates` 仍有严格含义：它只包含对该边**全部**已对齐样本精确成立的
-全局交集，且仍是唯一进入 `candidate_index` 的候选集合。多边区域的分解不能因为局部样本支持某个公式，就
-把该公式误标为整个 DOT 边的确定更新。
+对 `hypothetical_candidate`，先按 `cycle_id` 分区分别构建各自的最简模型树，再求这些局部最简树的
+精确交集。交集非空时，顶层 `candidates` 采用交集；多个循环分区的交集为空时，才把所有分区样本合并，
+重新搜索能精确覆盖联合样本的最简树，并在 `combined_sample_fit` 中记录触发原因、样本数和结果。
 
-同时，结果中的 `hypothetical_reconciliation` 按 `cycle_id` 保存每个循环分区的局部模型树、跨分区
-`intersection_candidates` 与 `non_consensus_candidates`。局部候选只说明该分区在当前拆分假设下的解释，
-即使全局交集为空也必须保留，以便后续后缀、额外信号或源码对照反驳、合并或细化它们。
+`hypothetical_candidate_resolution` 始终保留每个循环的局部树、`intersection_candidates`、联合拟合和
+最终选择来源。局部优先搜索可能先返回简单叶，从而不枚举同样能覆盖该循环的较复杂阈值树；因此局部
+最简树交集为空后，必须合并全部循环样本重新拟合。联合拟合成功则采用其精确候选；仍无候选时记录
+`combined_sample_fit_failed` 边级错误，顶层候选为空，但继续处理其他边，并允许本边继续进入迁移和反推。
 
-冲突的判定比“公式不相同”更严格：只有同一完整类型化观察键（`r_before`、带字段身份和出现序号的信号与
-数值输入、输入寄存器值）实际对应多个 `r_after` 时，才输出 `confirmed_observational_conflict` 及全部证据。
-若局部公式不同而观察键未重叠，则仅为 `partition_divergent`；两种信息均保留，算法不得任意挑选一棵树。
+工具按完整有效信号上下文、`logical_input` 和 `logical_output` 合并单边区域，生成“相对稳定推断”；
+不适用信号的 I/O 才只按输入输出合并。相对稳定推断不仅保存公式，还保存绑定的 `{s=value}`、输入寄存器
+槽和来源边。相对稳定推断迁移检验只在同一 `{s}/input/output` 分组中进行：直接把目标映射区域的
+`r_before`、边后有效 `r_i` 和信号量代入模型树，比较预测 `r_after` 与实际 `r_after`。无匹配分组时只记录
+“无可迁移的相对稳定推断”。
+
+每个相对稳定推断仍按简单叶、单阈值、派生值分裂的顺序生成。某个已接受结果首次含有
+`derived_value_guard: r_i == T` 时，立即把任意整数 `T` 加入本次脚本剩余生命周期的动态偏好集合；已经
+生成的候选不回排，配置禁止预设 `T`。后续精确候选中，常数赋值 `r'=T` 最高，含同一 `r_i==T` 分裂的
+候选其次，其他候选按原复杂度排序；所有精确候选继续保留，`r+k`、`r_i+k` 或偶然输出 `T` 不等同于
+常数赋值。
+
+迁移不成立时，在本次结果覆盖的上下行 KSI 全局观测并集中反推终止观察边之前最近的无下行边。更早
+无下行边逐条保留 `r'=r` 假设；允许前像、全部精确候选及来源目标边保存在 `backward_inference`，并与
+前序边和迁移分区双向引用。它不覆盖原前向候选，也不宣称定位了真实实现更新。
 
 ## 结构性弱先验
 
@@ -324,24 +337,23 @@ JSONL 行号，以及将**配置指定**字段解析为整数或布尔值；原�
 
 ```powershell
 D:\anaconda3\python.exe D:\state-learning-lab\projects\state-learning-tools\analysis\register_inference\experiments\prepare_register_inference_trace.py `
-  --config <record>\analysis\derived\register_inference\c01-c14-ngksi-signal-inference.yaml `
+  --config <record>\analysis\register-inference\config.yaml `
   --source-trace D:\state-learning-lab\run-data\<platform>\<run-id>\statelearner_trace.jsonl `
   --evidence-trace <record>\evidence\statelearner_trace.jsonl `
-  --manifest <record>\analysis\derived\register_inference\c01-c14-trace-materialization.json
+  --manifest <record>\analysis\register-inference\trace-materialization.json
 
 D:\anaconda3\python.exe D:\state-learning-lab\projects\state-learning-tools\analysis\register_inference\experiments\infer_cycle_ngksi_regions.py `
-  --config <record>\analysis\derived\register_inference\c01-c14-ngksi-signal-inference.yaml `
-  --output <record>\analysis\derived\register_inference\c01-c14-ngksi-signal-candidates.json `
-  --report <record>\analysis\derived\register_inference\c01-c14-ngksi-signal-summary.md `
-  --workbook <record>\analysis\derived\register_inference\c01-c14-ngksi-signal-details.xlsx
+  --config <record>\analysis\register-inference\config.yaml `
+  --output <record>\analysis\register-inference\candidates.json `
+  --report <record>\analysis\register-inference\summary.md
 ```
 
-对于 schema v3，`--report` 与 `--workbook` 都是必填项。Markdown 按 H13 的四列固定布局
-HTML 格式摘要全部具体边组；完整审计工作簿以 `cycle_id` 为主键，分别保存边级协调、循环—边
-使用、`V01…` 变体、逐公式候选及协调证据。同一边在不同循环中分别列出，且所有全局、交集、
-非共识和局部并列公式都不得折叠或选择其一。`hypothetical_candidate` 与
-`relatively_stable_candidate` 必须作为 Excel 的独立候选类型列；不以物理 `.seq` 行号作为阅读主键。
-交集为空与 `confirmed_observational_conflict` 必须分开标注；前者不自动成为矛盾。
+对于 schema v3，`--report` 是必填项。只有明确请求 Excel 审计时才追加
+`--workbook <record>\analysis\register-inference\audit.xlsx`。Markdown 按 H13 的四列固定布局
+HTML 格式摘要全部具体边组；Excel 只保留“循环边使用”工作表，以 `cycle_id` 和稳定 `V01…` 变体为
+阅读主键，不显示环内序号。同一边在不同循环中分别列出，候选类型、本循环候选、最简交集或联合拟合、
+候选生成结果、相对稳定推断、迁移检验、反推状态和反推候选与假设在同一行展示。并列公式使用
+`① … ｜ ② …` 横排；完整树、循环局部候选、交集、联合拟合、全部迁移与反推样本仍由 JSON 保存。
 
 面向读者的 Markdown 与 Excel 统一使用展示简写：`unknown/<reason>` 显示为 `unknown`，
 `r_i[ngksi_uplink]` 显示为 `r_i`，输入寄存器更新不显示括号内的观察来源；候选类型、观测状态、

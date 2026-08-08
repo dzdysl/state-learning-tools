@@ -1639,98 +1639,188 @@ def selected_cycle_metadata(
     )
 
 
-def build_cycle_smp_dot(
-    result: AnalysisResult,
-    basename: str,
-    candidate: CandidateCycle,
-    cycle_id: str,
-    color: str,
-) -> str:
-    source_text = result.target_model.path.read_text(encoding="utf-8")
-    target_by_pair = {edge.pair: edge for edge in result.target_edges}
-    candidate_identities = set(candidate.edge_identities)
-    route = " → ".join((*candidate.nodes, candidate.nodes[0]))
+def edge_svg_id(edge: Transition) -> str:
+    """Return a stable SVG/XML id for one concrete DOT transition."""
+    serialized = json.dumps(
+        concrete_edge_key(edge), ensure_ascii=True, separators=(",", ":")
+    ).encode("ascii")
+    return "cc-edge-" + hashlib.sha256(serialized).hexdigest()[:24]
 
+
+def route_highlight_edges(route: Route) -> tuple[Transition, ...]:
+    edges = list(route.edges)
+    if route.embedded_loop is not None:
+        edges.append(route.embedded_loop)
+    return tuple(
+        {concrete_edge_key(edge): edge for edge in edges}.values()
+    )
+
+
+def build_fixed_layout_smp_dot(
+    target_model: DotModel,
+    supplemental_edges: Iterable[Transition],
+    basename: str,
+    group_name: str,
+) -> tuple[str, frozenset[str]]:
+    """Build the one neutral DOT that every SVG in an analysis group shares."""
+    source_text = target_model.path.read_text(encoding="utf-8")
+    full_target_model = parse_dot(target_model.path)
+    target_queues: dict[tuple[str, str, str], deque[Transition]] = defaultdict(deque)
+    for edge in full_target_model.edges:
+        target = replace(edge, kind="target")
+        target_queues[(target.src, target.dst, target.label)].append(target)
+
+    supplemental_by_key = {
+        concrete_edge_key(edge): edge for edge in supplemental_edges
+    }
+    all_edges = [
+        *(replace(edge, kind="target") for edge in full_target_model.edges),
+        *supplemental_by_key.values(),
+    ]
+    edge_ids = [edge_svg_id(edge) for edge in all_edges]
+    if len(edge_ids) != len(set(edge_ids)):
+        raise CycleCoverError("Stable SVG edge id collision in fixed group layout.")
+
+    opening = source_text.find("{")
+    closing = source_text.rfind("}")
+    if opening < 0 or closing < 0:
+        raise CycleCoverError(f"Target DOT is malformed: {target_model.path}")
     graph_attributes = (
         '\n  graph [overlap=false, splines=true, bgcolor="white", '
         'fontname="Microsoft YaHei", fontsize=20, labelloc="t", '
         'pad=0.25, nodesep=0.65, ranksep=0.85, '
-        f'label="{dot_escape(basename)} {cycle_id}｜长度 {candidate.length}\\n'
-        f'{dot_escape(route)}\\n'
-        '彩色实线=本环SMP目标边；彩色虚线=原始H13补充闭环边；'
-        '黑色=其余SMP边"];\n'
+        f'label="{dot_escape(basename)}｜{dot_escape(group_name)}组固定底图\\n'
+        '彩色边=当前路线；黑色实线=SMP边；黑色虚线=本组补充边"];\n'
         '  node [fontname="Microsoft YaHei", fontsize=12, '
         'color="#475569", penwidth=1.4];\n'
         '  edge [fontname="Microsoft YaHei", fontsize=9, arrowsize=0.8];\n'
     )
-    opening = source_text.find("{")
-    if opening < 0:
-        raise CycleCoverError(
-            f"Target DOT has no graph opening brace: {result.target_model.path}"
-        )
     source_text = (
         source_text[: opening + 1]
         + graph_attributes
         + source_text[opening + 1 :]
     )
 
-    def recolor_target(match: re.Match[str]) -> str:
+    def annotate_target(match: re.Match[str]) -> str:
         indent, src, dst, attributes = match.groups()
-        target = target_by_pair.get((src, dst))
-        if target is None:
+        label_match = LABEL_RE.search(attributes)
+        if label_match is None:
             return match.group(0)
-        if target.identity not in candidate_identities:
-            return (
-                f"{indent}{src} -> {dst} [{attributes}, "
-                'color="black", fontcolor="black", '
-                'style="solid", penwidth=1.0];'
+        label = unescape_dot_label(label_match.group(1))
+        queue = target_queues.get((src, dst, label))
+        if not queue:
+            raise CycleCoverError(
+                f"Could not match concrete target edge while building fixed layout: "
+                f"{src}->{dst} [{label}]"
             )
+        edge = queue.popleft()
         return (
-            f"{indent}{src} -> {dst} [{attributes}, "
-            f'color="{color}", fontcolor="{color}", '
-            f'style="solid", penwidth=4.0, '
-            f'tooltip="{cycle_id}"];'
+            f'{indent}{src} -> {dst} [{attributes}, id="{edge_svg_id(edge)}", '
+            'color="black", fontcolor="black", style="solid", penwidth=2.0];'
         )
 
-    source_text = EDGE_STATEMENT_RE.sub(recolor_target, source_text)
-    closing = source_text.rfind("}")
-    if closing < 0:
+    source_text = EDGE_STATEMENT_RE.sub(annotate_target, source_text)
+    unmatched = [edge for queue in target_queues.values() for edge in queue]
+    if unmatched:
+        edge = unmatched[0]
         raise CycleCoverError(
-            f"Target DOT has no graph closing brace: {result.target_model.path}"
+            "Concrete target edge was not found in its source DOT while building "
+            f"fixed layout: {edge.src}->{edge.dst} [{edge.label}]"
         )
 
-    additions = [
-        "",
-        f"  // Original-H13 transitions added only to close {cycle_id}.",
-    ]
-    for node in candidate.nodes:
-        additions.append(
-            f'  {node} [color="{color}", penwidth=2.8, '
-            'style="filled", fillcolor="#ffffff"];'
-        )
-    closure_edges = sorted(
-        (edge for edge in candidate.edges if edge.kind == "closure"),
-        key=lambda edge: (
-            state_key(edge.src),
-            state_key(edge.dst),
-            edge.order,
-            edge.label,
+    closing = source_text.rfind("}")
+    additions = ["", "  // Union of supplemental edges used by this analysis group."]
+    for edge in sorted(
+        supplemental_by_key.values(),
+        key=lambda item: (
+            state_key(item.src), state_key(item.dst), item.order, item.label
         ),
-    )
-    for edge in closure_edges:
+    ):
         additions.append(
-            f'  {edge.src} -> {edge.dst} '
-            f'[label="{dot_escape(edge.label)}", '
-            f'tooltip="{cycle_id} (closure)", color="{color}", '
-            f'fontcolor="{color}", style="dashed", '
-            "penwidth=4.0, constraint=false];"
+            f'  {edge.src} -> {edge.dst} [id="{edge_svg_id(edge)}", '
+            f'label="{dot_escape(edge.label)}", color="black", '
+            'fontcolor="black", style="dashed", penwidth=2.0, '
+            'constraint=false];'
         )
     additions.append("")
     return (
-        source_text[:closing]
-        + "\n".join(additions)
-        + source_text[closing:]
+        source_text[:closing] + "\n".join(additions) + source_text[closing:],
+        frozenset(edge_ids),
     )
+
+
+def derive_highlighted_svg(
+    canonical_svg: Path,
+    output: Path,
+    active_edge_ids: frozenset[str],
+    color: str,
+) -> None:
+    """Copy fixed SVG geometry and change only the active edges' colours."""
+    tree = ET.parse(canonical_svg)
+    root = tree.getroot()
+    found_edge_ids: set[str] = set()
+    for group in root.iter():
+        if group.attrib.get("class") != "edge":
+            continue
+        group_id = group.attrib.get("id", "")
+        found_edge_ids.add(group_id)
+        if group_id not in active_edge_ids:
+            continue
+        for element in group.iter():
+            tag = element.tag.rsplit("}", 1)[-1]
+            if tag == "path":
+                element.set("stroke", color)
+            elif tag == "polygon":
+                element.set("stroke", color)
+                element.set("fill", color)
+            elif tag == "text":
+                element.set("fill", color)
+    missing = active_edge_ids - found_edge_ids
+    if missing:
+        raise CycleCoverError(
+            "Fixed-layout SVG is missing active concrete edge ids: "
+            + ", ".join(sorted(missing))
+        )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(output.name + ".tmp")
+    try:
+        tree.write(temporary, encoding="utf-8", xml_declaration=True)
+        ET.parse(temporary)
+        os.replace(temporary, output)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def render_fixed_layout_cycle_svgs(
+    canonical_dot: str,
+    canonical_edge_ids: frozenset[str],
+    route_specs: Sequence[tuple[str, str, Sequence[Transition], Path]],
+    engine: str,
+) -> dict[str, Any]:
+    """Run Graphviz once, then derive every route SVG without relayout."""
+    with tempfile.TemporaryDirectory(prefix="cyclecover_fixed_layout_") as temporary:
+        canonical_svg = Path(temporary) / "canonical.svg"
+        render_svg(canonical_dot, canonical_svg, engine)
+        canonical_bytes = canonical_svg.stat().st_size
+        canonical_sha256 = sha256_file(canonical_svg)
+        for route_id, color, edges, output in route_specs:
+            active_ids = frozenset(edge_svg_id(edge) for edge in edges)
+            unknown = active_ids - canonical_edge_ids
+            if unknown:
+                raise CycleCoverError(
+                    f"Route {route_id} contains edges outside its fixed layout: "
+                    + ", ".join(sorted(unknown))
+                )
+            derive_highlighted_svg(canonical_svg, output, active_ids, color)
+    return {
+        "mode": "fixed_group_layout",
+        "graphviz_layout_count": 1,
+        "canonical_edge_count": len(canonical_edge_ids),
+        "canonical_svg_bytes": canonical_bytes,
+        "canonical_svg_sha256": canonical_sha256,
+        "per_route_change": "edge_color_only",
+    }
 
 
 def artifact_record(path: Path, relative_to: Path) -> dict[str, Any]:
@@ -2187,6 +2277,18 @@ def generate_outputs(
     cycles_dir = output / "cycles"
     selected_ids, colors, _ = selected_cycle_metadata(result)
     selected_artifacts: dict[str, dict[str, Any]] = {}
+    supplemental_edges = tuple(
+        {
+            concrete_edge_key(edge): edge
+            for candidate in result.selected
+            for edge in candidate.edges
+            if edge.kind == "closure"
+        }.values()
+    )
+    canonical_dot, canonical_edge_ids = build_fixed_layout_smp_dot(
+        result.target_model, supplemental_edges, basename, "选定环"
+    )
+    route_specs: list[tuple[str, str, Sequence[Transition], Path]] = []
     for selected_index, candidate in enumerate(result.selected, start=1):
         cycle_id = selected_ids[candidate.candidate_id]
         stem = (
@@ -2194,14 +2296,11 @@ def generate_outputs(
             f"len{candidate.length:02d}"
         )
         svg_path = cycles_dir / f"{stem}.svg"
-        dot_text = build_cycle_smp_dot(
-            result,
-            basename=basename,
-            candidate=candidate,
-            cycle_id=cycle_id,
-            color=colors[cycle_id],
-        )
-        render_svg(dot_text, svg_path, engine=engine)
+        route_specs.append((cycle_id, colors[cycle_id], candidate.edges, svg_path))
+    figure_layout = render_fixed_layout_cycle_svgs(
+        canonical_dot, canonical_edge_ids, route_specs, engine
+    )
+    for cycle_id, _, _, svg_path in route_specs:
         selected_artifacts[cycle_id] = artifact_record(svg_path, output)
 
     sequence_export = None
@@ -2220,6 +2319,7 @@ def generate_outputs(
         selected_artifacts=selected_artifacts,
         sequence_export=sequence_export,
     )
+    payload["figure_layout"] = figure_layout
     report_path = output / f"{basename}_cycle_cover_report.md"
     write_report(payload, report_path)
     payload["report_artifact"] = artifact_record(report_path, output)
@@ -2440,60 +2540,6 @@ def write_route_sequence_export(
     return metadata
 
 
-def build_route_smp_dot(
-    analysis: LayeredAnalysis,
-    basename: str,
-    route: Route,
-    color: str,
-) -> str:
-    source_text = analysis.target_model.path.read_text(encoding="utf-8")
-    candidate_target_labels = {
-        (edge.src, edge.dst, edge.label)
-        for edge in route.edges
-        if edge.kind == "target"
-    }
-    opening = source_text.find("{")
-    closing = source_text.rfind("}")
-    if opening < 0 or closing < 0:
-        raise CycleCoverError(f"Target DOT is malformed: {analysis.target_model.path}")
-    route_text = " → ".join((*route.nodes, route.nodes[0]))
-    attributes = (
-        '\n  graph [overlap=false, splines=true, bgcolor="white", '
-        'fontname="Microsoft YaHei", fontsize=20, labelloc="t", '
-        f'label="{dot_escape(basename)} {route.route_id}｜{dot_escape(route.route_kind)}\\n'
-        f'{dot_escape(route_text)}"];\n'
-    )
-    source_text = source_text[: opening + 1] + attributes + source_text[opening + 1 :]
-
-    def recolor(match: re.Match[str]) -> str:
-        indent, src, dst, attrs = match.groups()
-        label_match = LABEL_RE.search(attrs)
-        label = unescape_dot_label(label_match.group(1)) if label_match else ""
-        if (src, dst, label) in candidate_target_labels:
-            return (
-                f'{indent}{src} -> {dst} [{attrs}, color="{color}", '
-                f'fontcolor="{color}", style="solid", penwidth=4.0];'
-            )
-        return (
-            f'{indent}{src} -> {dst} [{attrs}, color="black", '
-            'fontcolor="black", style="solid", penwidth=1.0];'
-        )
-
-    source_text = EDGE_STATEMENT_RE.sub(recolor, source_text)
-    closing = source_text.rfind("}")
-    additions = [""]
-    closure_edges = [edge for edge in route.edges if edge.kind == "closure"]
-    if route.embedded_loop is not None:
-        closure_edges.append(route.embedded_loop)
-    for edge in sorted({concrete_edge_key(edge): edge for edge in closure_edges}.values(), key=lambda edge: edge.order):
-        additions.append(
-            f'  {edge.src} -> {edge.dst} [label="{dot_escape(edge.label)}", '
-            f'color="{color}", fontcolor="{color}", style="dashed", '
-            'penwidth=4.0, constraint=false];'
-        )
-    return source_text[:closing] + "\n".join(additions) + source_text[closing:]
-
-
 def build_base_cycle_overlay_dot(
     analysis: LayeredAnalysis,
     routes: Sequence[Route],
@@ -2679,9 +2725,28 @@ def generate_layered_group(
     )
     colors = {route.route_id: CYCLE_PALETTE[index % len(CYCLE_PALETTE)] for index, route in enumerate(routes)}
     route_entries: list[dict[str, Any]] = []
+    supplemental_edges = tuple(
+        {
+            concrete_edge_key(edge): edge
+            for route in routes
+            for edge in route_highlight_edges(route)
+            if edge.kind == "closure"
+        }.values()
+    )
+    canonical_dot, canonical_edge_ids = build_fixed_layout_smp_dot(
+        analysis.target_model, supplemental_edges, basename, group_name
+    )
+    route_specs: list[tuple[str, str, Sequence[Transition], Path]] = []
     for index, route in enumerate(routes, start=1):
         svg_path = output / "cycles" / f"{basename}_{route.route_id}_len{route.length:02d}.svg"
-        render_svg(build_route_smp_dot(analysis, basename, route, colors[route.route_id]), svg_path, engine)
+        route_specs.append(
+            (route.route_id, colors[route.route_id], route_highlight_edges(route), svg_path)
+        )
+    figure_layout = render_fixed_layout_cycle_svgs(
+        canonical_dot, canonical_edge_ids, route_specs, engine
+    )
+    for index, route in enumerate(routes, start=1):
+        svg_path = route_specs[index - 1][3]
         route_entries.append({**route_payload(route), "color": colors[route.route_id], "artifact": artifact_record(svg_path, output)})
     payload: dict[str, Any] = {
         "schema_version": 4,
@@ -2708,6 +2773,7 @@ def generate_layered_group(
         "fallback_target_ids": sorted(fallback_target_ids),
         "routes": route_entries,
         "sequence_export": sequence,
+        "figure_layout": figure_layout,
     }
     report_path = output / f"{basename}_cycle_cover_report.md"
     write_layered_report(payload, report_path)

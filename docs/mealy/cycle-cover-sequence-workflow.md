@@ -198,28 +198,40 @@ message names and field paths are stable.
 ### Required inference record
 
 The register-inference configuration, materialization manifest, machine-readable
-candidate JSON, reader-facing Markdown summary and complete Excel audit workbook
-are one inseparable derived set. Schema v3 inference requires both `--report` and
-`--workbook`; a generic model-consistency report or a launcher log is not a
-substitute. The Markdown summary and workbook metadata must link the complete
-evidence trace, exact `.seq`, original DOT, cycle-cover JSON, configuration and
-result JSON by SHA-256. They must state the fitted repetitions, configured fields,
-unknown branches, alignment anomalies, candidate grade, and the distinction
-between `partition_divergent` and `confirmed_observational_conflict`.
+candidate JSON and reader-facing Markdown summary are the default derived set.
+Schema v3 inference requires `--report`; a complete Excel audit workbook is generated
+only when explicitly requested with `--workbook`. A generic model-consistency report
+or a launcher log is not a substitute. The Markdown summary, and workbook metadata
+when a workbook is requested, must link the complete evidence trace, exact `.seq`,
+original DOT, cycle-cover JSON, configuration and result JSON by SHA-256. They must
+state the fitted repetitions, configured fields, unknown branches, alignment anomalies,
+candidate grade, hypothetical-candidate resolution, relatively stable inference migration
+and backward inference.
 
 The required Markdown is the H13-style reader summary: one fixed-layout HTML
 table with every concrete DOT edge group and the four columns “cycle, edge and
 nodes / edge candidate / input register / candidate grade”. It preserves tied
-global candidates but refers detailed material to the workbook. The required
-Excel workbook contains separate filtered sheets for edge coordination, every
-`cycle_id` edge use, deterministic `V01…` variants and complete `loop_inputs`,
-candidate records, and reconciliation evidence. A repeated edge appears once in
-every cycle-use row. The workbook must keep all tied global, intersection,
-non-consensus and cycle-local candidates, expose candidate grade as its own
-column, and distinguish an empty intersection from a recorded
-`confirmed_observational_conflict`. Message pairs break after `/`; the Markdown
-uses HTML `colgroup` fixed widths, while the workbook freezes its header row,
-enables filters, wraps text and uses readable column widths.
+global candidates. When explicitly requested, the Excel workbook contains only the
+filtered “循环边使用” sheet. A repeated edge
+appears once for every `cycle_id` use; deterministic `V01…` variants remain
+visible, while the loop-edge ordinal is omitted. Candidate grade, cycle-local
+candidates, the minimal intersection or combined fit, candidate-generation result,
+relatively stable inference, migration result and first counterexample share one row. Tied
+formulas use a horizontal `① … ｜ ② …` layout. Separate backward-inference
+status and candidate/assumption columns show any nearest no-downlink predecessor
+inference without merging it into the original forward candidates. Full trees, non-consensus
+candidates, combined-sample fits and all counterexamples remain lossless in
+JSON. The workbook centers all cells, freezes its header row, enables filters,
+wraps text and uses compact widths for columns A-I.
+
+Stable references are generated before preference feedback. If their actual
+candidate trees contain `derived_value_guard: r_i == T`, the observed integer
+`T` values order only later derived-value-guard searches. They are not YAML
+constants and do not prefer a constant leaf `r'=T`. A numeric transfer failure
+on a terminal signal context absent from the stable reference is untestable,
+not a mismatch. A mismatch on an observed context may infer only the nearest
+no-downlink predecessor over the current run's observed global KSI domain;
+earlier no-downlink predecessors remain explicit `r'=r` assumptions.
 
 Workbook render previews belong in a system temporary directory and are inspected there. The
 artifact-tool `<workbook>.inspect.ndjson` sidecar is an intermediate verification file, not evidence

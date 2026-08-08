@@ -31,11 +31,10 @@ H13_TARGET = H13_RECORD / "analysis" / "derived" / "hypothesis_13_smp.dot"
 H13_CLOSURE = H13_RECORD / "evidence" / "hypotheses" / "hypothesis_13.dot"
 H13_AVAILABLE = H13_TARGET.is_file() and H13_CLOSURE.is_file()
 H14_RECORD = (
-    H13_RECORD
-    / "followups"
-    / "h14-learning-complete-finalizer-failed-20260801"
+    H13_RECORD.parent
+    / "h14-complete-teardown-20260801"
 )
-H14_TARGET = H14_RECORD / "analysis" / "derived" / "hypothesis_14_smp.dot"
+H14_TARGET = H14_RECORD / "analysis" / "model" / "smp.dot"
 H14_CLOSURE = H14_RECORD / "evidence" / "hypotheses" / "hypothesis_14.dot"
 H14_AVAILABLE = H14_TARGET.is_file() and H14_CLOSURE.is_file()
 
@@ -44,6 +43,21 @@ def write_dot(directory: Path, name: str, body: str) -> Path:
     path = directory / name
     path.write_text("digraph G {\n" + body + "\n}\n", encoding="utf-8")
     return path
+
+
+def fixed_svg_signature(path: Path) -> tuple[tuple[str, str, str], bytes, frozenset[str]]:
+    """Ignore edge colours while retaining all SVG layout and content."""
+    root = ET.parse(path).getroot()
+    dimensions = tuple(root.attrib.get(name, "") for name in ("width", "height", "viewBox"))
+    edge_ids: set[str] = set()
+    for group in root.iter():
+        if group.attrib.get("class") != "edge":
+            continue
+        edge_ids.add(group.attrib.get("id", ""))
+        for element in group.iter():
+            for attribute in ("fill", "stroke"):
+                element.attrib.pop(attribute, None)
+    return dimensions, ET.tostring(root, encoding="utf-8"), frozenset(edge_ids)
 
 
 def analyze_h13() -> cycle_cover.AnalysisResult:
@@ -673,70 +687,35 @@ class H13IntegrationTests(unittest.TestCase):
                 payload["validation"]["all_selected_artifacts_are_svg"]
             )
 
-    def test_h13_full_smp_cycle_svgs_are_well_formed(self) -> None:
+    def test_h13_cycle_svgs_share_one_fixed_layout(self) -> None:
         try:
             cycle_cover.resolve_graphviz_engine("dot")
         except cycle_cover.CycleCoverError as error:
             self.skipTest(str(error))
 
         result = analyze_h13()
-        selected_ids, colors, _ = cycle_cover.selected_cycle_metadata(result)
-        for candidate in result.selected:
-            cycle_id = selected_ids[candidate.candidate_id]
-            dot_text = cycle_cover.build_cycle_smp_dot(
-                result,
-                basename="hypothesis_13",
-                candidate=candidate,
-                cycle_id=cycle_id,
-                color=colors[cycle_id],
-            )
-            closure_count = sum(
-                edge.kind == "closure" for edge in candidate.edges
-            )
-            target_count = sum(
-                edge.kind == "target" for edge in candidate.edges
-            )
-            distinct_target_count = len(
-                {
-                    edge.identity
-                    for edge in candidate.edges
-                    if edge.kind == "target"
-                }
-            )
-            self.assertIn("__start0 -> s0;", dot_text)
-            self.assertIn('s2 [shape="circle" label="s2"]', dot_text)
-            self.assertEqual(34 + closure_count, dot_text.count(" -> "))
-            self.assertEqual(
-                distinct_target_count,
-                dot_text.count('style="solid", penwidth=4.0'),
-            )
-            self.assertEqual(
-                33 - distinct_target_count,
-                dot_text.count(
-                    'color="black", fontcolor="black", '
-                    'style="solid", penwidth=1.0'
-                ),
-            )
-            self.assertEqual(
-                closure_count,
-                dot_text.count('style="dashed"'),
-            )
-            self.assertIn(colors[cycle_id], dot_text)
-
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            cycle_cover.generate_outputs(
-                result,
-                root,
-                basename="hypothesis_13",
-                formats={"svg"},
-                engine="dot",
-                overwrite=False,
-            )
+            with mock.patch.object(
+                cycle_cover, "render_svg", wraps=cycle_cover.render_svg
+            ) as renderer:
+                cycle_cover.generate_outputs(
+                    result,
+                    root,
+                    basename="hypothesis_13",
+                    formats={"svg"},
+                    engine="dot",
+                    overwrite=False,
+                )
+            self.assertEqual(1, renderer.call_count)
             svgs = sorted((root / "cycles").glob("*.svg"))
             self.assertEqual(14, len(svgs))
             self.assertFalse(list(root.rglob("*.dot")))
             self.assertFalse(list(root.rglob("*.pdf")))
+            signatures = [fixed_svg_signature(svg) for svg in svgs]
+            self.assertEqual(1, len({signature[0] for signature in signatures}))
+            self.assertEqual(1, len({signature[1] for signature in signatures}))
+            self.assertEqual(1, len({signature[2] for signature in signatures}))
             for svg in svgs:
                 self.assertGreater(svg.stat().st_size, 0)
                 svg_root = ET.parse(svg).getroot()
@@ -905,20 +884,24 @@ class LayeredRouteTests(unittest.TestCase):
             analysis = cycle_cover.build_layered_analysis(
                 target, closure, [], [], ["authenticationRequest"]
             )
-            summary = cycle_cover.generate_layered_outputs(
-                analysis,
-                root / "base",
-                "base",
-                root / "base.seq",
-                "s0",
-                2,
-                "expand",
-                "dot",
-                False,
-                root / "extra",
-                "extra",
-                root / "extra.seq",
-            )
+            with mock.patch.object(
+                cycle_cover, "render_svg", wraps=cycle_cover.render_svg
+            ) as renderer:
+                summary = cycle_cover.generate_layered_outputs(
+                    analysis,
+                    root / "base",
+                    "base",
+                    root / "base.seq",
+                    "s0",
+                    2,
+                    "expand",
+                    "dot",
+                    False,
+                    root / "extra",
+                    "extra",
+                    root / "extra.seq",
+                )
+            self.assertEqual(2, renderer.call_count)
             self.assertIn("base", summary)
             self.assertIn("extra", summary)
             self.assertTrue((root / "base.seq").is_file())
@@ -926,6 +909,11 @@ class LayeredRouteTests(unittest.TestCase):
             self.assertTrue((root / "base" / "base_cycle_cover.json").is_file())
             self.assertTrue((root / "extra" / "extra_cycle_cover.json").is_file())
             base_payload = json.loads((root / "base" / "base_cycle_cover.json").read_text(encoding="utf-8"))
+            extra_payload = json.loads((root / "extra" / "extra_cycle_cover.json").read_text(encoding="utf-8"))
+            self.assertEqual("fixed_group_layout", base_payload["figure_layout"]["mode"])
+            self.assertEqual("edge_color_only", base_payload["figure_layout"]["per_route_change"])
+            self.assertEqual(1, base_payload["figure_layout"]["graphviz_layout_count"])
+            self.assertEqual(1, extra_payload["figure_layout"]["graphviz_layout_count"])
             self.assertIn("cycles", base_payload["sequence_export"])
             self.assertNotIn("routes", base_payload["sequence_export"])
             self.assertEqual(
@@ -933,8 +921,16 @@ class LayeredRouteTests(unittest.TestCase):
                 base_payload["sequence_export"]["cycles"][0]["route_id"],
             )
             self.assertIn("loop_inputs", base_payload["sequence_export"]["cycles"][0]["variants"][0])
-            for svg in list((root / "base" / "cycles").glob("*.svg")) + list((root / "extra" / "cycles").glob("*.svg")):
+            base_svgs = sorted((root / "base" / "cycles").glob("*.svg"))
+            extra_svgs = sorted((root / "extra" / "cycles").glob("*.svg"))
+            for svg in base_svgs + extra_svgs:
                 self.assertTrue(ET.parse(svg).getroot().tag.endswith("svg"))
+            for svgs in (base_svgs, extra_svgs):
+                signatures = [fixed_svg_signature(svg) for svg in svgs]
+                self.assertEqual(1, len({signature[0] for signature in signatures}))
+                self.assertEqual(1, len({signature[1] for signature in signatures}))
+                self.assertEqual(1, len({signature[2] for signature in signatures}))
+            self.assertNotEqual(base_svgs[0].read_bytes(), base_svgs[-1].read_bytes())
             base_routes = (
                 analysis.base_simple_routes
                 + analysis.base_fallback_routes
@@ -985,6 +981,44 @@ class H14LayeredIntegrationTests(unittest.TestCase):
         self.assertEqual(70, len(extra_lines))
         self.assertTrue(base_metadata["validation"]["all_lines_simulated_against_closure_dot"])
         self.assertTrue(extra_metadata["validation"]["all_lines_close_after_each_iteration"])
+
+    def test_h14_s008_and_s036_share_identical_base_geometry(self) -> None:
+        try:
+            cycle_cover.resolve_graphviz_engine("dot")
+        except cycle_cover.CycleCoverError as error:
+            self.skipTest(str(error))
+        analysis = cycle_cover.build_layered_analysis(
+            H14_TARGET,
+            H14_CLOSURE,
+            excluded_states=["s2"],
+            required_inputs=[],
+            required_outputs=["authenticationRequest", "securityModeCommand"],
+            signal_mode="output-only",
+        )
+        routes = (
+            analysis.base_simple_routes
+            + analysis.base_fallback_routes
+            + analysis.standalone_self_loops
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cycle_cover.generate_layered_group(
+                analysis,
+                routes,
+                "基础",
+                root / "base",
+                "hypothesis_14_base",
+                root / "base.seq",
+                "s0",
+                10,
+                "expand",
+                "dot",
+                False,
+            )
+            s008 = next((root / "base" / "cycles").glob("*_S008_*.svg"))
+            s036 = next((root / "base" / "cycles").glob("*_S036_*.svg"))
+            self.assertEqual(fixed_svg_signature(s008), fixed_svg_signature(s036))
+            self.assertNotEqual(s008.read_bytes(), s036.read_bytes())
 
 
 if __name__ == "__main__":

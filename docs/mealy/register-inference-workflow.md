@@ -114,10 +114,37 @@ mapping:
 下行可见的 `r`。第 2 轮用于初始化，含该类型输入的循环从第 3 轮起拟合。单边精确候选标为
 `relatively_stable_candidate`；多边区域的前序最简/末端拟合拆分标为 `hypothetical_candidate`。
 
-对假设性候选，顶层 `candidates` 仍只保留跨全部已对齐样本精确成立的交集，并据此建立
-`candidate_index`。同时读取 `hypothetical_reconciliation`：它按循环分区保留局部模型树、跨分区交集、
-非共识候选和冲突证据。局部树不应并入全局索引；同一完整类型化观察键却得到多个 `r_after` 时必须标为
-`confirmed_observational_conflict`，而仅公式不同且观察键未重叠时标为 `partition_divergent`。
+对假设性候选，先按循环分区构建各自的最简模型树。局部最简树交集非空时采用交集；多个循环分区的
+交集为空时，才合并分区样本重新搜索最简逻辑，并在 `combined_sample_fit` 中保存结果。联合拟合成功时
+采用其精确候选；联合拟合仍无候选时，为该具体边记录结构化 `combined_sample_fit_failed`，候选为空，
+但继续处理其他边，并允许该边进入相对稳定推断迁移检验与前序反推。不得任意挑选局部公式继续前向推断。
+
+工具按完整有效信号上下文、`logical_input` 和 `logical_output` 合并单边区域，生成带上下文绑定的
+“相对稳定推断”；不适用已配置信号的 I/O 才只按输入输出合并。随后只在相同 `{s}/input/output` 下，
+把假设性目标区域的 `r_before`、边后有效 `r_i` 和信号量直接代入模型树，比较预测值与实际 `r_after`。
+无相同分组时记录“无可迁移的相对稳定推断”；迁移不成立时才尝试前序反推。
+
+每个相对稳定推断严格按简单叶、单阈值和 `derived_value_guard` 的顺序搜索。某个已接受结果首次出现
+`derived_value_guard: r_i == T` 后，立即把 `T` 激活为脚本剩余生命周期的动态排序偏好。已经生成的
+候选不回排，配置不得预设 `T`。后续若精确常数 `r'=T` 覆盖当前全部样本，它排在首位；含相同
+`r_i==T` 派生值分裂的候选其次；其余仍按原复杂度排序。`r+k`、`r_i+k` 或偶然输出 `T` 不等同于
+常数赋值。
+
+可选的前序反推使用封闭配置：
+
+```yaml
+analysis:
+  backward_inference:
+    enabled: true
+    value_domain: observed_global
+    predecessor_policy: nearest_no_downlink_predecessor
+    earlier_predecessor_policy: hold
+    signal_scope: matching_effective_signal_context
+```
+
+迁移只对同一完整有效信号上下文执行。预测值与实际值不一致时，在全局观测值域中枚举终止观察边之前
+最近无 KSI 下行边的允许输出，并保持更早无下行边为 `r'=r`。反推候选单列保存，不并入该边原有前向
+候选，也不解释为真实源码更新。
 
 候选树严格区分三类分裂：
 

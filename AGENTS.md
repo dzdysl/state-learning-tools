@@ -2,6 +2,15 @@
 
 This repository is the single versioned source for cross-platform state-learning analysis, rendering, archival, and workspace-operation tools. Keep platform-specific source changes in their respective repositories and experimental evidence in `state-learning-experiments`.
 
+## Terminology discipline
+
+- Reader-facing reports, workflow documents, schemas and status values must use terminology already established by the user
+  and by the nearest applicable `AGENTS.md`. Do not invent a synonym, classification or workflow name unless the user asks
+  for one, or the existing term is genuinely ambiguous and the ambiguity is explained first.
+- Compatibility fields, internal enums and temporary implementation names are not automatically reader-facing terms. When a
+  domain has a dedicated `AGENTS.md`, that file is the single detailed terminology and algorithm contract; repository-level
+  guidance should point to it instead of copying a second version.
+
 ## Generated file lifecycle
 
 - When generating files from a user command, retain only requested final deliverables plus required source evidence, provenance, and versioned tool inputs.
