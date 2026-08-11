@@ -1,2 +1,4 @@
 PyYAML>=6.0
 z3-solver>=4.16
+matplotlib>=3.8
+plotly>=5.0

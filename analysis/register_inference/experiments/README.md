@@ -8,6 +8,33 @@
   --config <region-inference.yaml> --output <result.json>
 ```
 
+## 循环轨迹后处理
+
+`cluster_cycle_trajectories.py` 是候选推断完成后的独立后处理入口；它只读取已有的
+`candidates.json`，不会修改推断器或候选结果。它保留原始八个 `samples`，把 R3–R9 作为七点周期，严格以
+R10 校验 R3 同相位（仅可用 R10 的 `i` 补齐缺失 R3 `i`），再生成两个周期的 14 个 `analysis_points`。
+补齐点明确标记为模式补齐，不是 Open5GS 实测数据。轨迹仅在相同 `logical_input/logical_output/isInitMsg`
+切片内比较，`s` 不进入距离，跨切片不自动匹配；14 点完全相同或切片混合的轨迹保留在结果中但不参与聚类。其范围限于相对稳定推断和
+多边区域的假设性候选；前序最简、前序反推、迁移失败以及没有匹配相对稳定推断 I/O 的对象均不参与。
+
+```powershell
+& D:\anaconda3\python.exe .\cluster_cycle_trajectories.py `
+  --candidates <candidates.json> --config <trajectory-clustering.yaml> `
+  --output <trajectory-clusters.json> --report <trajectory-clustering-report.md>
+```
+
+配置可为空 YAML 映射；可覆盖 `gamma`、位置/方向权重、轮廓阈值、合并高度比阈值和 `max_clusters`，并固定
+支持 `signal_slice_id: isInitMsg`、`period_length: 7`、`completed_cycles: 2`、`completion_policy: strict_same_phase`
+及 `low_discriminability_policy: exclude`。
+该模块只报告轨迹相似与分簇，不改变“相对稳定推断”“假设性候选”或“前序反推”的算法语义。
+
+```powershell
+& D:\anaconda3\python.exe .\visualize_cycle_trajectories.py `
+  --input <trajectory-clusters.json> --output-dir <trajectory-figures>
+```
+
+可视化只消费 `register-trajectory-clustering-v2` JSON：输出完全离线的 Plotly HTML 和 stable、hypothetical、joint 三张 SVG；灰色无箭头线表示低辨别力轨迹。
+
 Minimal configuration:
 
 ```yaml

@@ -94,6 +94,10 @@
     `{s}/logical_input/logical_output`；即使 `logical_input` 相同，只要 `logical_output` 不同，也不得把
     反推分支补入另一组相对稳定推断。
 
+## 循环轨迹后处理
+
+`cluster_cycle_trajectories.py` 是本推断完成后的独立后处理，不属于候选语言、区域构造、相对稳定推断迁移检验或前序反推的组成部分。它只能读取已生成的 `candidates.json`：以同一 `cycle_id + sequence_line` 的直接区域为有序轨迹，只在相同 `logical_input/logical_output/isInitMsg` 切片内进行比较。它纳入相对稳定推断和 `region_edge_count > 1` 的假设性候选；必须排除 `minimal_predecessor_default`、所有前序反推、迁移失败和无匹配相对稳定推断 I/O 的对象。schema v2 将 R3–R9 的七点周期复制为 14 个分析点，R3/R10 仅允许严格同相位校验或由 R10 补齐缺失 R3 `i`，不得趋势外推；模式补齐点不得表述为实测。信号不进入距离，低辨别力或混合切片轨迹不得进入距离矩阵、簇数选择或迁移一致性。其分簇结果是后续比较证据，不得反向改写候选、迁移检验或前序反推结论。
+
 ## 报告边界
 
 - 候选应同时报告公式、对齐异常、覆盖链、拆分假设、未观察分支和可用反例。
