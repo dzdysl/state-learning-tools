@@ -33,7 +33,7 @@ def sha256(path: Path) -> str:
 def render_report(result: dict[str, Any]) -> str:
     counts = result["counts"]
     lines = [
-        "# 轨迹归类算法 B：二维公式候选、稳定性聚合与前序最简归因",
+        "# 轨迹归类算法 B：二维公式候选、稳定性聚合与新稳定推断",
         "",
         "## 范围与口径",
         "",
@@ -91,6 +91,54 @@ def render_report(result: dict[str, Any]) -> str:
         else:
             lines.append("- 当前没有通过全稳定样本验证的聚合公式。")
         lines.append("")
+    new_stable = result["new_stable_inference"]
+    yes_no = lambda value: "是" if value else "否"
+    lines.extend(["## 新稳定推断", ""])
+    lines.append(
+        "本阶段只使用前序重划后完整、动态的新增长度1区域。先核对旧稳定三元组包含、主要方向和旧树逐点验证；"
+        "全部成立时复用旧聚合公式，否则按相同 input/output 与 s 联合旧、新样本重新聚合。"
+    )
+    lines.append(
+        "不同 s 分支公式相同时化简为单一公式，但分支样本来源和计数仍分别保存；只有公式不同时才生成信号根节点。"
+    )
+    lines.append("")
+    for input_output, item in new_stable["by_input_output"].items():
+        method = {
+            "reused_old_aggregation": "复用旧稳定聚合",
+            "same_signal_joint_reaggregation": "同信号旧、新样本联合重聚合",
+        }.get(item.get("method"), item.get("method") or "未生成")
+        lines.extend(
+            [
+                f"### `{input_output}`",
+                "",
+                f"- 方法：{method}；旧轨迹 {item['old_trajectory_count']} 条/{item['old_sample_count']} 点，"
+                f"新轨迹 {item['new_trajectory_count']} 条/{item['new_sample_count']} 点。",
+            ]
+        )
+        for signal_value, evidence in item.get("signal_evidence", {}).items():
+            lines.append(
+                f"- `s={signal_value}`：旧样本 {evidence['old_sample_count']} 点，"
+                f"新样本 {evidence['new_sample_count']} 点；新轨迹 `{evidence['new_trajectory_ids']}`。"
+            )
+        for validation in item.get("trajectory_validations", []):
+            edge = validation["edge"]
+            lines.append(
+                f"- `{validation['trajectory_id']}`：`{edge['source_state']}→{edge['target_state']}` "
+                f"`{edge['logical_input']}/{edge['logical_output']}`；完整={yes_no(validation['complete_r3_r10'])}，"
+                f"落入旧稳定轨迹={yes_no(validation['contained_in_old_stable_triples'])}，"
+                f"方向一致={yes_no(validation['direction_consistent'])}，旧公式精确={yes_no(validation['old_formula_exact'])}。"
+            )
+        if item.get("final_candidates"):
+            for candidate in item["final_candidates"]:
+                verification = candidate["verification"]
+                simplified = "；相同信号分支已合并" if candidate["identical_signal_branches_simplified"] else ""
+                lines.append(
+                    f"- 最终公式：`{candidate['formula']}`{simplified}；逐点验证 "
+                    f"{verification['matched_sample_count']}/{verification['sample_count']}。"
+                )
+        else:
+            lines.append(f"- 当前状态：`{item['status']}`；原因：`{item.get('failure_reason', '无')}`。")
+        lines.append("")
     predecessor = result["predecessor_repartition"]
     pc = predecessor["counts"]
     lines.extend(
@@ -98,6 +146,7 @@ def render_report(result: dict[str, Any]) -> str:
             "## 前序最简归因与伪下行重划",
             "",
             "本阶段直接读取全部已选 I/O 的假设性观察区域；旧迁移状态只作审计，不参与筛选，也不读取旧前序反推候选。",
+            "前序保持只把最近真实 KSI 下行的可观察值连续延伸到保持边；中间出现非延伸假设性边即中断，后续保持边不能自行恢复连续性或建立观察锚点。",
             f"输入清单共 {pc['hypothetical_trajectory_count']} 条轨迹；旧迁移状态计数 "
             f"`{pc['input_old_migration_statuses']}`，其中不满足长度2或动态门槛者仍保留排除原因。",
             f"长度2且R3–R10完整、循环内三元组动态变化的轨迹共 {pc['dynamic_length_two_trajectory_count']} 条："
@@ -247,9 +296,10 @@ def render_report(result: dict[str, Any]) -> str:
             "- 有缺口的候选只说明已观察 x 上精确成立，不把未观察 x 当作验证结果。",
             "- 第一阶段候选类型和信号上下文只作审计，不参与边级候选发现或候选组划分。",
             "- 稳定性推断聚合只联合相对稳定推断的源边；优先选择完整简单公式，仅在唯一输入寄存器值形成铅垂成分时构造并逐点验证跨投影模型树。",
-            "- `s` 只作为聚合公式的适用条件，不生成信号根节点。前序最简阶段独立于旧迁移检验与旧前序反推，只把旧状态保留为审计字段。",
+            "- 旧稳定聚合中的 `s` 只作为公式适用条件。新稳定推断比较不同信号分支：公式相同即合并，只有不同且均精确时才生成信号根节点。",
+            "- 前序最简阶段独立于旧迁移检验与旧前序反推，只把旧状态保留为审计字段；其页面入口暂时禁用，但 JSON 审计数据继续保留。",
             "- 前序不变推断是带稳定轨迹包含与主要方向前提的可反驳假设；反向集合前像只更新证据事件的伪 `r_after`，不产生前序边公式。",
-            "- 伪下行只进行一轮观察区域重划；伪边界不构成独立稳定证据，新增长度1区域本阶段不重新拟合公式。",
+            "- 伪下行只进行一轮观察区域重划；保持边仅连续延伸此前真实 KSI 下行，遇到非延伸假设性边即中断，不能自行建立观察锚点。伪边界不构成独立稳定证据，新增长度1区域本阶段不重新拟合公式。",
             "",
             "## 排版检查",
             "",

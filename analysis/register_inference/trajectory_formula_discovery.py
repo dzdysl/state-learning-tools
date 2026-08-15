@@ -16,7 +16,7 @@ from itertools import product
 from typing import Any, Iterable
 
 
-SCHEMA = "register-trajectory-formula-discovery-v4"
+SCHEMA = "register-trajectory-formula-discovery-v5"
 DEFAULT_INPUT_OUTPUTS = (
     ("authenticationResponse", "securityModeCommand"),
     ("registrationRequest", "authenticationRequest"),
@@ -187,6 +187,7 @@ def reconstruct_trajectories(
                     "sequence_line": sequence_line,
                     "logical_input": str(edge["logical_input"]),
                     "logical_output": str(edge["logical_output"]),
+                    "edge": edge,
                     "candidate_grade": result.get("candidate_grade"),
                     "signal_context": points[0]["signal_context"],
                     "points": points,
@@ -730,6 +731,13 @@ def _evaluate_update_tree(tree: dict[str, Any], point: dict[str, Any]) -> int:
             return int(point["r_i"]) + int(formula["value"])
         raise ValueError(f"unknown update formula kind {formula_kind}")
     guard = tree["guard"]
+    if kind == "signal_guard":
+        signal_id = str(guard.get("signal_id", "isInitMsg"))
+        signal_context = point.get("signal_context", {})
+        if signal_id not in signal_context:
+            raise ValueError(f"missing signal {signal_id} for signal_guard")
+        branch = tree["true"] if int(signal_context[signal_id]) == int(guard["value"]) else tree["false"]
+        return _evaluate_update_tree(branch, point)
     value = int(point["r_before"] if guard["variable"] == "r" else point["r_i"])
     if kind == "threshold_guard":
         branch = tree["true"] if value < int(guard["threshold"]) else tree["false"]
@@ -755,6 +763,10 @@ def update_tree_text(tree: dict[str, Any], abbreviated: bool = True) -> str:
                 return variable
             return f"{variable} {'+' if offset > 0 else '-'} {abs(offset)}"
         guard = node["guard"]
+        if node["kind"] == "signal_guard":
+            signal_id = str(guard.get("signal_id", "isInitMsg"))
+            variable = "s" if abbreviated and signal_id == "isInitMsg" else signal_id
+            return f"ite({variable} = {guard['value']}, {expression(node['true'])}, {expression(node['false'])})"
         variable = "r" if guard["variable"] == "r" else (
             "r_i" if abbreviated else INPUT_REGISTER
         )
@@ -797,6 +809,10 @@ def _verify_update_tree(
             total += 1
             if tree["kind"] == "derived_value_guard":
                 value = point["r_before"] if tree["guard"]["variable"] == "r" else point["r_i"]
+                branch_counts["true" if value == tree["guard"]["value"] else "false"] += 1
+            elif tree["kind"] == "signal_guard":
+                signal_id = str(tree["guard"].get("signal_id", "isInitMsg"))
+                value = point.get("signal_context", {}).get(signal_id)
                 branch_counts["true" if value == tree["guard"]["value"] else "false"] += 1
             predicted = _evaluate_update_tree(tree, point)
             if predicted == int(point["r_after"]):
@@ -1162,6 +1178,7 @@ def _repartition_assignment_scenario(
             current_before = int(region["previous_output"]["value"])
             pending: list[dict[str, Any]] = []
             segment_index = 0
+            observable_extension_valid = True
             for event in region.get("region_edges", []):
                 pending.append(event)
                 edge = event["edge"]
@@ -1174,10 +1191,13 @@ def _repartition_assignment_scenario(
                     boundary_kind = "pseudo_reverse_preimage"
                     pseudo_after = int(reverse_choices[reverse_key])
                     assumption = "scenario_consistent_preimage_value"
-                elif edge_id in hold_edge_ids:
+                    observable_extension_valid = False
+                elif edge_id in hold_edge_ids and observable_extension_valid:
                     boundary_kind = "pseudo_hold"
                     pseudo_after = current_before
-                    assumption = "edge_level_conditional_hold"
+                    assumption = "continuous_observable_downlink_extension"
+                elif edge_id not in hold_edge_ids:
+                    observable_extension_valid = False
                 if boundary_kind is None:
                     continue
                 grouped[(identifier, edge_id, segment_index, int(trajectory["sequence_line"]), boundary_kind)].append(
@@ -1570,10 +1590,319 @@ def infer_predecessor_repartition(
         "eligible_length_one_regions": [eligible_index[key] for key in sorted(eligible_index)],
         "boundaries": {
             "hold_is_conditional_and_refutable": True,
+            "hold_extends_preceding_real_downlink_only_while_continuous": True,
+            "non_extension_hypothetical_edge_interrupts_hold_extension": True,
+            "interrupted_hold_does_not_create_a_new_observation_anchor": True,
             "reverse_preimage_does_not_infer_edge_formula": True,
             "pseudo_boundaries_are_not_independent_stable_evidence": True,
             "repartition_is_single_pass_without_formula_fitting": True,
         },
+    }
+
+
+def _trajectory_signal_value(trajectory: dict[str, Any]) -> int | None:
+    context = trajectory.get("signal_context", {})
+    if not context:
+        return None
+    if set(context) != {"isInitMsg"}:
+        raise ValueError(f"unsupported signal context for {trajectory['id']}: {context}")
+    value = int(context["isInitMsg"])
+    if value not in (0, 1):
+        raise ValueError(f"isInitMsg must be 0 or 1 for {trajectory['id']}")
+    return value
+
+
+def _new_stable_candidate_id(
+    logical_input: str, logical_output: str, tree: dict[str, Any]
+) -> str:
+    identity = json.dumps(
+        ["new_stable_inference", logical_input, logical_output, tree],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"NS-{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:10]}"
+
+
+def combine_signal_branch_trees(
+    branch_trees: dict[int, dict[str, Any]],
+) -> tuple[dict[str, Any], bool]:
+    """Combine exact signal branches, simplifying identical normalized trees."""
+    if not branch_trees:
+        raise ValueError("at least one signal branch is required")
+    keys = sorted(branch_trees)
+    normalized = {_tree_key(branch_trees[key]) for key in keys}
+    if len(normalized) == 1:
+        return branch_trees[keys[0]], True
+    if keys != [0, 1]:
+        raise ValueError(f"different formulas require observed s=0 and s=1 branches, got {keys}")
+    return {
+        "kind": "signal_guard",
+        "guard": {"signal_id": "isInitMsg", "operator": "==", "value": 1},
+        "true": branch_trees[1],
+        "false": branch_trees[0],
+    }, False
+
+
+def _aggregate_signal_branch(
+    logical_input: str,
+    logical_output: str,
+    trajectories: list[dict[str, Any]],
+    signal_value: int,
+) -> dict[str, Any]:
+    source_eids = sorted({trajectory["eid"] for trajectory in trajectories})
+    synthetic = {
+        "relatively_stable_inference": {
+            "groups": [
+                {
+                    "group_index": 0,
+                    "logical_input": logical_input,
+                    "logical_output": logical_output,
+                    "signal_context": [{"signal_id": "isInitMsg", "value": signal_value}],
+                    "source_edge_ids": source_eids,
+                }
+            ]
+        }
+    }
+    return aggregate_stable_inference(
+        synthetic,
+        trajectories,
+        [(logical_input, logical_output)],
+    )["by_input_output"][f"{logical_input}/{logical_output}"]
+
+
+def aggregate_new_stable_inference(
+    trajectories: list[dict[str, Any]],
+    stable_aggregation: dict[str, Any],
+    predecessor_repartition: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate newly eligible dynamic length-one trajectories and aggregate by signal."""
+    trajectory_index = {trajectory["id"]: trajectory for trajectory in trajectories}
+    eligible = predecessor_repartition.get("eligible_length_one_regions", [])
+    selected = [
+        trajectory_index[item["id"]]
+        for item in eligible
+        if item["id"] in trajectory_index
+    ]
+    selected_by_io: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for trajectory in selected:
+        selected_by_io[
+            f"{trajectory['logical_input']}/{trajectory['logical_output']}"
+        ].append(trajectory)
+
+    by_io: dict[str, Any] = {}
+    total_final_candidates = 0
+    all_old_ids: set[str] = set()
+    all_new_ids: set[str] = set()
+    for io, new_trajectories in sorted(selected_by_io.items()):
+        old_entry = stable_aggregation.get("by_input_output", {}).get(io, {})
+        logical_input, logical_output = io.split("/", 1)
+        old_ids = set(old_entry.get("source_trajectory_ids", []))
+        old_trajectories = [
+            trajectory for trajectory in trajectories if trajectory["id"] in old_ids
+        ]
+        old_points = {
+            (int(point["r_before"]), int(point["r_i"]), int(point["r_after"]))
+            for trajectory in old_trajectories
+            for point in trajectory["points"]
+        }
+        old_direction = {
+            field: _axis_direction(old_trajectories, field)
+            for field in ("r_before", "r_i")
+        }
+        trajectory_validations = []
+        for trajectory in sorted(new_trajectories, key=lambda item: item["id"]):
+            repetitions = [int(point["repetition"]) for point in trajectory["points"]]
+            complete = repetitions == list(range(3, 11))
+            triples = {
+                (int(point["r_before"]), int(point["r_i"]), int(point["r_after"]))
+                for point in trajectory["points"]
+            }
+            contained = bool(old_points) and triples.issubset(old_points)
+            directions = {}
+            direction_consistent = True
+            for field in ("r_before", "r_i"):
+                observed = _trajectory_direction(trajectory, field)
+                reference = old_direction[field]
+                active = observed["forward"] + observed["reverse"] > 0
+                matches = not active or (
+                    reference["majority"] != "mixed"
+                    and observed["majority"] == reference["majority"]
+                )
+                directions[field] = {
+                    "active": active,
+                    "observed": observed,
+                    "stable_reference": reference,
+                    "matches": matches,
+                }
+                direction_consistent = direction_consistent and matches
+            matching_candidates = [
+                candidate
+                for candidate in old_entry.get("final_candidates", [])
+                if _verify_update_tree(candidate["update_tree"], [trajectory])["exact"]
+            ]
+            exact_old_formula = bool(matching_candidates)
+            trajectory_validations.append(
+                {
+                    "trajectory_id": trajectory["id"],
+                    "eid": trajectory["eid"],
+                    "edge": trajectory["edge"],
+                    "signal_context": trajectory.get("signal_context", {}),
+                    "complete_r3_r10": complete,
+                    "contained_in_old_stable_triples": contained,
+                    "direction": directions,
+                    "direction_consistent": direction_consistent,
+                    "matching_old_candidate_ids": [
+                        candidate["candidate_id"] for candidate in matching_candidates
+                    ],
+                    "old_formula_exact": exact_old_formula,
+                    "reuse_eligible": complete and contained and direction_consistent and exact_old_formula,
+                }
+            )
+
+        combined_trajectories = old_trajectories + new_trajectories
+        signals: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        signal_error = None
+        try:
+            for trajectory in combined_trajectories:
+                value = _trajectory_signal_value(trajectory)
+                if value is None:
+                    raise ValueError(f"signal is not applicable for {trajectory['id']}")
+                signals[value].append(trajectory)
+        except ValueError as exc:
+            signal_error = str(exc)
+
+        entry: dict[str, Any] = {
+            "logical_input": logical_input,
+            "logical_output": logical_output,
+            "status": "pending",
+            "method": None,
+            "old_member_ids": sorted(old_ids),
+            "new_member_ids": sorted(trajectory["id"] for trajectory in new_trajectories),
+            "old_trajectory_count": len(old_trajectories),
+            "new_trajectory_count": len(new_trajectories),
+            "old_sample_count": sum(len(item["points"]) for item in old_trajectories),
+            "new_sample_count": sum(len(item["points"]) for item in new_trajectories),
+            "trajectory_validations": trajectory_validations,
+            "signal_evidence": {
+                str(value): {
+                    "signal_context": {"isInitMsg": value},
+                    "old_trajectory_ids": sorted(
+                        item["id"] for item in items if item["id"] in old_ids
+                    ),
+                    "new_trajectory_ids": sorted(
+                        item["id"] for item in items if item["id"] not in old_ids
+                    ),
+                    "old_sample_count": sum(
+                        len(item["points"]) for item in items if item["id"] in old_ids
+                    ),
+                    "new_sample_count": sum(
+                        len(item["points"]) for item in items if item["id"] not in old_ids
+                    ),
+                }
+                for value, items in sorted(signals.items())
+            },
+            "final_candidates": [],
+        }
+        all_old_ids.update(old_ids)
+        all_new_ids.update(entry["new_member_ids"])
+        if signal_error:
+            entry["status"] = "inconsistent_signal_context"
+            entry["failure_reason"] = signal_error
+            by_io[io] = entry
+            continue
+
+        reuse_ok = bool(trajectory_validations) and all(
+            item["reuse_eligible"] for item in trajectory_validations
+        )
+        exact_old_candidates = [
+            candidate
+            for candidate in old_entry.get("final_candidates", [])
+            if _verify_update_tree(candidate["update_tree"], combined_trajectories)["exact"]
+        ]
+        branch_candidates: dict[int, list[dict[str, Any]]] = {}
+        if reuse_ok and exact_old_candidates:
+            entry["method"] = "reused_old_aggregation"
+            for signal_value in sorted(signals):
+                branch_candidates[signal_value] = exact_old_candidates
+        else:
+            entry["method"] = "same_signal_joint_reaggregation"
+            for signal_value, branch_trajectories in sorted(signals.items()):
+                branch_result = _aggregate_signal_branch(
+                    logical_input, logical_output, branch_trajectories, signal_value
+                )
+                branch_candidates[signal_value] = branch_result.get("final_candidates", [])
+            if any(not items for items in branch_candidates.values()):
+                entry["status"] = "no_exact_signal_branch_candidate"
+                entry["failure_reason"] = "at least one observed signal branch has no exact aggregate"
+                by_io[io] = entry
+                continue
+
+        combined_candidates: dict[str, dict[str, Any]] = {}
+        combinations = product(*(branch_candidates[value] for value in sorted(branch_candidates)))
+        for combination in combinations:
+            branch_trees = {
+                value: candidate["update_tree"]
+                for value, candidate in zip(sorted(branch_candidates), combination)
+            }
+            tree, simplified = combine_signal_branch_trees(branch_trees)
+            verification = _verify_update_tree(tree, combined_trajectories)
+            if not verification["exact"]:
+                continue
+            key = _tree_key(tree)
+            combined_candidates.setdefault(
+                key,
+                {
+                    "candidate_id": _new_stable_candidate_id(logical_input, logical_output, tree),
+                    "formula": update_tree_text(tree),
+                    "formula_expanded": update_tree_text(tree, abbreviated=False),
+                    "update_tree": tree,
+                    "formula_kind": (
+                        "signal_guard"
+                        if tree["kind"] == "signal_guard"
+                        else "cross_projection_tree"
+                        if tree["kind"] == "derived_value_guard"
+                        else "simple_formula"
+                    ),
+                    "signal_branch_formulas": {
+                        str(value): candidate["formula"]
+                        for value, candidate in zip(sorted(branch_candidates), combination)
+                    },
+                    "identical_signal_branches_simplified": simplified and len(branch_trees) > 1,
+                    "verification": verification,
+                },
+            )
+        entry["final_candidates"] = [
+            combined_candidates[key] for key in sorted(combined_candidates)
+        ]
+        entry["status"] = "inferred" if entry["final_candidates"] else "combined_validation_failed"
+        if not entry["final_candidates"]:
+            entry["failure_reason"] = "combined signal tree did not validate all old and new samples"
+        total_final_candidates += len(entry["final_candidates"])
+        by_io[io] = entry
+
+    return {
+        "method": "new_stable_reuse_then_same_signal_joint_reaggregation",
+        "reuse_requirements": [
+            "complete_R3_R10",
+            "contained_in_old_stable_triples",
+            "deduplicated_segment_majority_direction_consistent",
+            "old_aggregate_tree_exact",
+        ],
+        "signal_tree_policy": "different_exact_branches_use_signal_guard_identical_branches_simplify",
+        "counts": {
+            "input_output_count": len(by_io),
+            "old_trajectory_count": len(all_old_ids),
+            "new_trajectory_count": len(all_new_ids),
+            "old_sample_count": sum(
+                item["old_sample_count"] for item in by_io.values()
+            ),
+            "new_sample_count": sum(
+                item["new_sample_count"] for item in by_io.values()
+            ),
+            "final_candidate_count": total_final_candidates,
+        },
+        "by_input_output": by_io,
     }
 
 
@@ -1731,6 +2060,9 @@ def analyze(
     predecessor_repartition = infer_predecessor_repartition(
         candidates, trajectories, stable_aggregation
     )
+    new_stable_inference = aggregate_new_stable_inference(
+        trajectories, stable_aggregation, predecessor_repartition
+    )
     return {
         "schema": SCHEMA,
         "settings": {
@@ -1744,6 +2076,9 @@ def analyze(
             "minimum_affine_distinct_x": 3,
             "vertical_core_distinct_y": 3,
             "predecessor_repartition_passes": 1,
+            "new_stable_inference_signal_policy": (
+                "different_exact_branches_use_signal_guard_identical_branches_simplify"
+            ),
         },
         "counts": {
             "input_output_count": len(selected_pairs),
@@ -1788,5 +2123,6 @@ def analyze(
         "candidate_groups": output_groups,
         "stable_aggregation": stable_aggregation,
         "predecessor_repartition": predecessor_repartition,
+        "new_stable_inference": new_stable_inference,
         "trajectories": trajectories,
     }

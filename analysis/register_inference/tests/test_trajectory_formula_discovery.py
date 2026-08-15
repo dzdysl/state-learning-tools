@@ -7,10 +7,15 @@ import yaml
 
 from analysis.register_inference.trajectory_formula_discovery import (
     AXES,
+    _evaluate_update_tree,
+    _repartition_assignment_scenario,
+    aggregate_new_stable_inference,
     aggregate_stable_inference,
     analyze,
+    combine_signal_branch_trees,
     discover_projection,
     preimage_values,
+    update_tree_text,
 )
 from analysis.register_inference.experiments.visualize_trajectory_formula_candidates import (
     display_formula_groups,
@@ -64,6 +69,20 @@ def stable_source(*edge_ids):
                 }
             ]
         }
+    }
+
+
+def repartition_event(eid, logical_input, logical_output, position):
+    return {
+        "edge": {
+            "edge_id": eid,
+            "source_state": f"s{position}",
+            "target_state": f"s{position + 1}",
+            "logical_input": logical_input,
+            "logical_output": logical_output,
+        },
+        "event_position": position,
+        "input_register_values": {},
     }
 
 
@@ -255,6 +274,87 @@ class StableAggregationUnitTest(unittest.TestCase):
         self.assertEqual(result["status"], "inconsistent_signal_context")
         self.assertEqual(result["final_candidates"], [])
 
+    def test_identical_signal_branches_simplify_without_losing_signal_evidence(self):
+        tree = {"kind": "leaf", "formula": {"kind": "r_plus", "value": 0}}
+        combined, simplified = combine_signal_branch_trees({0: tree, 1: tree})
+        self.assertIs(combined, tree)
+        self.assertTrue(simplified)
+        self.assertNotEqual(combined["kind"], "signal_guard")
+
+    def test_different_signal_branches_create_a_real_evaluable_guard(self):
+        zero = {"kind": "leaf", "formula": {"kind": "constant", "value": 0}}
+        one = {"kind": "leaf", "formula": {"kind": "constant", "value": 1}}
+        combined, simplified = combine_signal_branch_trees({0: zero, 1: one})
+        self.assertFalse(simplified)
+        self.assertEqual(combined["kind"], "signal_guard")
+        self.assertEqual(_evaluate_update_tree(combined, {"signal_context": {"isInitMsg": 0}}), 0)
+        self.assertEqual(_evaluate_update_tree(combined, {"signal_context": {"isInitMsg": 1}}), 1)
+        self.assertEqual(update_tree_text(combined), "r' = ite(s = 1, 1, 0)")
+
+
+class NewStableInferenceUnitTest(unittest.TestCase):
+    @staticmethod
+    def item(identifier, values, *, signal, eid):
+        item = stable_trajectory(
+            identifier,
+            [(value, 7, value) for value in values],
+            eid=eid,
+            signal={"isInitMsg": signal},
+        )
+        item["edge"] = {
+            "edge_id": eid,
+            "source_state": "s1",
+            "target_state": "s2",
+            "logical_input": "input",
+            "logical_output": "output",
+        }
+        return item
+
+    def stable_result(self, old):
+        return aggregate_stable_inference(
+            {
+                "relatively_stable_inference": {
+                    "groups": [
+                        {
+                            "group_index": 0,
+                            "logical_input": "input",
+                            "logical_output": "output",
+                            "signal_context": [{"signal_id": "isInitMsg", "value": 0}],
+                            "source_edge_ids": [old["eid"]],
+                        }
+                    ]
+                }
+            },
+            [old],
+            [("input", "output")],
+        )
+
+    @staticmethod
+    def predecessor(identifier):
+        return {"eligible_length_one_regions": [{"id": identifier}]}
+
+    def test_direction_mismatch_falls_back_to_same_signal_joint_reaggregation(self):
+        old = self.item("E1:C:L1", [3, 2, 1, 0, 3, 2, 1, 0], signal=0, eid="E1")
+        new = self.item("E2:C:L2", [0, 1, 2, 3, 0, 1, 2, 3], signal=1, eid="E2")
+        result = aggregate_new_stable_inference(
+            [old, new], self.stable_result(old), self.predecessor(new["id"])
+        )["by_input_output"]["input/output"]
+        self.assertFalse(result["trajectory_validations"][0]["direction_consistent"])
+        self.assertEqual(result["method"], "same_signal_joint_reaggregation")
+        self.assertEqual(result["status"], "inferred")
+        self.assertEqual(result["final_candidates"][0]["formula"], "r' = r")
+        self.assertTrue(result["final_candidates"][0]["identical_signal_branches_simplified"])
+
+    def test_unfit_degenerate_signal_branch_returns_structured_failure(self):
+        old = self.item("E1:C:L1", [0, 1, 2, 3, 0, 1, 2, 3], signal=0, eid="E1")
+        new = self.item("E2:C:L2", [7] * 8, signal=1, eid="E2")
+        result = aggregate_new_stable_inference(
+            [old, new], self.stable_result(old), self.predecessor(new["id"])
+        )["by_input_output"]["input/output"]
+        self.assertEqual(result["method"], "same_signal_joint_reaggregation")
+        self.assertEqual(result["status"], "no_exact_signal_branch_candidate")
+        self.assertEqual(result["final_candidates"], [])
+
 
 @unittest.skipUnless(H14.exists(), "requires frozen H14 record")
 class H14FormulaDiscoveryIntegrationTest(unittest.TestCase):
@@ -267,7 +367,7 @@ class H14FormulaDiscoveryIntegrationTest(unittest.TestCase):
         cls.result = analyze(cls.candidates, cls.trace, cls.cycle_cover, cls.config)
 
     def test_exact_h14_scope_and_real_samples(self):
-        self.assertEqual(self.result["schema"], "register-trajectory-formula-discovery-v4")
+        self.assertEqual(self.result["schema"], "register-trajectory-formula-discovery-v5")
         self.assertEqual(self.result["counts"]["eid_count"], 29)
         self.assertEqual(self.result["counts"]["trajectory_count"], 87)
         self.assertEqual(self.result["counts"]["sample_count"], 696)
@@ -528,6 +628,88 @@ class H14FormulaDiscoveryIntegrationTest(unittest.TestCase):
             self.assertFalse(e0085["dynamic_triples"])
             self.assertFalse(e0085["next_stage_stable_inference_eligible"])
             self.assertEqual(e0085["exclusion_reason"], "static_triples")
+
+    def test_h14_new_stable_inference_reuses_and_simplifies_old_formulas(self):
+        result = self.result["new_stable_inference"]
+        self.assertEqual(
+            result["counts"],
+            {
+                "input_output_count": 2,
+                "old_trajectory_count": 18,
+                "new_trajectory_count": 5,
+                "old_sample_count": 144,
+                "new_sample_count": 40,
+                "final_candidate_count": 2,
+            },
+        )
+        expected = {
+            "registrationRequest/authenticationRequest": (
+                96,
+                "r' = ite(r < 6, r + 1, 0)",
+                ["E0133:S003:L3", "E0145:S005:L6", "E0145:S012:L14"],
+            ),
+            "registrationRequestGUTI/authenticationRequest": (
+                88,
+                "r' = ite(r_i = 7, ite(r < 6, r + 1, 0), ite(r_i < 6, r_i + 1, 0))",
+                ["E0050:S009:L12", "E0146:S012:L15"],
+            ),
+        }
+        for io, (sample_count, formula, new_ids) in expected.items():
+            item = result["by_input_output"][io]
+            self.assertEqual(item["status"], "inferred")
+            self.assertEqual(item["method"], "reused_old_aggregation")
+            self.assertEqual(item["new_member_ids"], new_ids)
+            self.assertTrue(all(x["reuse_eligible"] for x in item["trajectory_validations"]))
+            candidate = item["final_candidates"][0]
+            self.assertEqual(candidate["formula"], formula)
+            self.assertTrue(candidate["identical_signal_branches_simplified"])
+            self.assertNotEqual(candidate["update_tree"]["kind"], "signal_guard")
+            self.assertEqual(candidate["verification"]["matched_sample_count"], sample_count)
+            self.assertEqual(candidate["verification"]["sample_count"], sample_count)
+            self.assertEqual(set(item["signal_evidence"]), {"0", "1"})
+
+    def test_hold_only_extends_a_continuous_preceding_real_downlink(self):
+        terminal = repartition_event(
+            "T", "registrationRequest", "authenticationRequest", 3
+        )
+        hold = repartition_event("H", "deregistrationRequest", "null_action", 2)
+        interruption = repartition_event(
+            "X", "securityModeReject", "null_action", 1
+        )
+        trajectory = {
+            "id": "T:C:L1",
+            "eid": "T",
+            "candidate_grade": "hypothetical_candidate",
+            "cycle_id": "C",
+            "sequence_line": 1,
+            "points": [{"repetition": 3, "r_before": 0, "r_i": 7, "r_after": 1}],
+        }
+
+        def run(events):
+            regions = {
+                trajectory["id"]: {
+                    3: {
+                        "previous_output": {"value": 0},
+                        "terminal_output": {"value": 1},
+                        "region_edges": events,
+                    }
+                }
+            }
+            return _repartition_assignment_scenario(
+                [trajectory], regions, {"H"}, {}, "A"
+            )["repartitioned_regions"]
+
+        continuous = run([hold, terminal])
+        self.assertEqual(
+            ["pseudo_hold", "real_downlink"],
+            [item["boundary_kind"] for item in continuous],
+        )
+        self.assertEqual(["T"], continuous[-1]["region_edge_ids"])
+
+        interrupted = run([interruption, hold, terminal])
+        self.assertEqual(["real_downlink"], [item["boundary_kind"] for item in interrupted])
+        self.assertEqual(["X", "H", "T"], interrupted[0]["region_edge_ids"])
+        self.assertFalse(interrupted[0]["newly_length_one"])
 
 
 if __name__ == "__main__":
